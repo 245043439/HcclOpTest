@@ -236,6 +236,16 @@ cleanup() {
                 CLEANUP_STATUS=1
             fi
         done
+        # The run worker may have been interrupted before copying its result.
+        # Container cleanup leaves the atomic rank-0 checkpoint available.
+        if [[ -n "$CASE_RESULT_FILE" ]]; then
+            if docker cp "$CONTAINER_NAME:$REMOTE_RESULT_FILE" "$CASE_RESULT_FILE.tmp" \
+                    > "$LOG_DIR/checkpoint_collect.log" 2>&1; then
+                mv "$CASE_RESULT_FILE.tmp" "$CASE_RESULT_FILE"
+            else
+                echo "WARNING: checkpoint collection failed; see checkpoint_collect.log" >&2
+            fi
+        fi
         for idx in "${!NODES[@]}"; do
             if ! invoke "$idx" collect > "$LOG_DIR/node_${idx}.diagnostics.tar" 2> "$LOG_DIR/collect_${idx}.log"; then
                 echo "WARNING: node $idx diagnostic collection failed; see collect_${idx}.log" >&2

@@ -2,8 +2,13 @@
 import csv
 import ast
 import importlib.util
+import io
 import json
 import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +21,140 @@ SPEC.loader.exec_module(matrix)
 
 
 class BatchingTests(unittest.TestCase):
+    def test_restart_retries_unsuccessful_cases_and_preserves_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.config(directory)
+            cfg = matrix.load_config(path)
+            cases = matrix.make_topology_cases(cfg, 1, 2)
+            output = Path(cfg["output_csv"])
+            matrix.append_rows(output, [matrix.base_row(c, cfg, status, start=0, end=1)
+                for c, status in zip(cases, ["success", "failed", "timeout", "not_run"])])
+            launches, checkpoints = [], []
+
+            def launch(cmd, env, timeout, log_path, label):
+                batch = json.loads(env["MATRIX_CASES_JSON"])
+                launches.append([c["case_id"] for c in batch])
+                checkpoint = Path(env["CASE_RESULT_FILE"])
+                checkpoints.append(checkpoint)
+                checkpoint.write_text(json.dumps({"complete": True, "results": [
+                    dict(c, status="success", group_start=0, group_end=1) for c in batch]}))
+                return 0
+
+            argv = ["run_matrix.py", "--config", str(path), "--log-dir", str(Path(directory) / "logs")]
+            with mock.patch.dict(os.environ, {"NPROC_PER_NODE": "2", "HCCL_NODES": ""}), \
+                 mock.patch.object(matrix, "run_launcher", side_effect=launch):
+                with mock.patch("sys.argv", argv):
+                    self.assertEqual(matrix.main(), 0)
+                    contents = output.read_text()
+                    self.assertEqual(matrix.main(), 0)
+                    self.assertEqual(output.read_text(), contents)
+                self.assertEqual(launches, [[c["case_id"] for c in cases[1:]]])
+                old_checkpoint = checkpoints[0].read_text()
+                with mock.patch("sys.argv", argv + ["--no-resume"]):
+                    self.assertEqual(matrix.main(), 0)
+                self.assertEqual(launches[-1], [c["case_id"] for c in cases])
+                self.assertNotEqual(checkpoints[0], checkpoints[1])
+                self.assertEqual(checkpoints[0].read_text(), old_checkpoint)
+                with mock.patch("sys.argv", argv + ["--dry-run"]), \
+                     mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    self.assertEqual(matrix.main(), 0)
+                self.assertIn("planned_launches=0", stdout.getvalue())
+                self.assertEqual(len(launches), 2)
+
+    def test_resume_requires_matching_settings_and_complete_latest_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = matrix.load_config(self.config(directory))
+            cases = matrix.make_topology_cases(cfg, 1, 2)
+            path = Path(cfg["output_csv"])
+            self.assertEqual(matrix.successful_cases(path, cases, cfg), set())
+            matrix.append_rows(path, [matrix.base_row(c, cfg, "success", start=0, end=1)
+                                      for c in cases])
+            self.assertEqual(matrix.successful_cases(path, cases, cfg), {c["case_id"] for c in cases})
+            for key in ("warmup", "repeat"):
+                self.assertEqual(matrix.successful_cases(path, cases, dict(cfg, **{key: cfg[key] + 1})), set())
+            other_topology = matrix.make_topology_cases(cfg, 2, 1)
+            self.assertEqual(matrix.successful_cases(path, other_topology, cfg), set())
+            matrix.append_rows(path, [matrix.base_row(cases[0], cfg, "failed"),
+                                     matrix.base_row(cases[1], cfg, "success", start=0, end=0)])
+            self.assertEqual(matrix.successful_cases(path, cases, cfg), {c["case_id"] for c in cases[2:]})
+            with path.open("a") as stream:
+                row = matrix.base_row(cases[2], cfg, "success", start=0, end=1)
+                csv.writer(stream).writerow([row[field] for field in matrix.FIELDS[:-1]])
+            self.assertEqual(matrix.successful_cases(path, cases, cfg), {cases[3]["case_id"]})
+
+    def test_ctrl_c_collects_checkpoint_and_restart_skips_completed_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.config(directory)
+            cfg = matrix.load_config(path)
+            cases = matrix.make_topology_cases(cfg, 1, 2)
+            launcher = Path(directory) / "launcher.sh"
+            ready = Path(directory) / "ready"
+            launcher.write_text("""#!/bin/bash
+set -eu
+trap 'cp "$CASE_RESULT_FILE.container" "$CASE_RESULT_FILE"; exit 143' TERM
+python3 - <<'PYTHON'
+import json, os
+from pathlib import Path
+cases = json.loads(os.environ['MATRIX_CASES_JSON'])
+Path(os.environ['CASE_RESULT_FILE'] + '.container').write_text(json.dumps({
+    'results': [dict(cases[0], status='success', group_start=0, group_end=1)],
+    'current_case_id': cases[1]['case_id'], 'complete': False}))
+Path(os.environ['READY_FILE']).touch()
+PYTHON
+while true; do sleep 0.1 & wait $!; done
+""")
+            argv = [str(ROOT / "run_matrix.py"), "--config", str(path), "--launcher", str(launcher),
+                    "--log-dir", str(Path(directory) / "logs")]
+            env = dict(os.environ, NPROC_PER_NODE="2", HCCL_NODES="", READY_FILE=str(ready))
+            process = subprocess.Popen([sys.executable, *argv], env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists())
+                process.send_signal(signal.SIGINT)
+                output, _ = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 130, output)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+            completed = matrix.successful_cases(Path(cfg["output_csv"]), cases, cfg)
+            self.assertEqual(completed, {cases[0]["case_id"]})
+            with mock.patch("sys.argv", argv + ["--dry-run"]), \
+                 mock.patch.dict(os.environ, env), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(matrix.main(), 0)
+            self.assertIn("1 successful cases skipped; 3 combinations remaining", stdout.getvalue())
+
+    def test_unimported_checkpoint_recovery_is_idempotent_and_checks_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = matrix.load_config(self.config(directory))
+            cases = matrix.make_topology_cases(cfg, 1, 2)
+            output = Path(cfg["output_csv"])
+            logs = Path(directory) / "logs"
+            attempt = logs / "batch_test" / "attempt_1"
+            attempt.mkdir(parents=True)
+            (attempt / "attempt.json").write_text(json.dumps({
+                "output_csv": str(output), "warmup": cfg["warmup"], "repeat": cfg["repeat"],
+                "case_ids": [c["case_id"] for c in cases]}))
+            (attempt / "checkpoint.json").write_text(json.dumps({"results": [
+                dict(cases[0], status="success", group_start=0, group_end=1)],
+                "current_case_id": cases[1]["case_id"], "complete": False}))
+            recover = lambda settings=cfg, dry=False: matrix.recover_checkpoints(
+                logs, output, cases, settings, set(), dry)
+            self.assertEqual(recover(dict(cfg, repeat=2)), set())
+            self.assertEqual(recover(dry=True), {cases[0]["case_id"]})
+            self.assertFalse(output.exists())
+            self.assertEqual(recover(), {cases[0]["case_id"]})
+            contents = output.read_text()
+            self.assertEqual(recover(), set())
+            self.assertEqual(output.read_text(), contents)
+            matrix.append_rows(output, [matrix.base_row(cases[0], cfg, "failed")])
+            self.assertEqual(recover(), set())
+            self.assertEqual(matrix.successful_cases(output, cases, cfg), set())
+
     def config(self, directory):
         path = Path(directory) / "config.json"
         path.write_text(json.dumps({

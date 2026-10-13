@@ -161,6 +161,81 @@ def append_rows(path, rows):
         os.fsync(stream.fileno())
 
 
+def successful_cases(path, cases, cfg):
+    """Resume only complete world-group results with matching measurement settings."""
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    by_id = {case["case_id"]: case for case in cases}
+    completed = set()
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != FIELDS:
+            raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
+        for row in reader:
+            case_id = row.get("case_id")
+            case = by_id.get(case_id)
+            if case is None or (row.get("warmup"), row.get("repeat")) != (
+                    str(cfg["warmup"]), str(cfg["repeat"])):
+                continue
+            # The latest matching attempt wins, including a later failed rerun.
+            completed.discard(case_id)
+            if (None not in row and all(value is not None for value in row.values())
+                    and row["status"] == "success" and case["total_ranks"] is not None
+                    and row["rank_start"] == "0"
+                    and row["rank_end"] == str(case["total_ranks"] - 1)):
+                completed.add(case_id)
+    return completed
+
+
+def result_row(case, cfg, result, metadata, run_dir):
+    row = base_row(case, cfg, result.get("status", "failed"), result.get("reason", ""),
+                   str(run_dir), result.get("group_start", ""), result.get("group_end", ""))
+    row.update({key: result.get(key, "") for key in ("input_bytes", "output_bytes")})
+    row["actual_expansion_mode"] = result.get("actual_expansion_mode", "unknown")
+    row.update(metadata)
+    row.update(result.get("metrics", {}))
+    return row
+
+
+def recover_checkpoints(log_root, output_csv, cases, cfg, completed, dry_run=False):
+    """Import interrupted attempts only; consumed checkpoints must never override newer runs."""
+    completed = set(completed)
+    by_id = {case["case_id"]: case for case in cases}
+    for manifest_path in sorted(log_root.glob("batch_*/attempt_*/attempt.json")):
+        run_dir = manifest_path.parent
+        if (run_dir / "consumed").exists():
+            continue
+        checkpoint = run_dir / "checkpoint.json"
+        if not checkpoint.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if (manifest["output_csv"] != str(output_csv)
+                    or manifest["warmup"] != cfg["warmup"]
+                    or manifest["repeat"] != cfg["repeat"]):
+                continue
+            payload = json.loads(checkpoint.read_text())
+            for result in payload["results"]:
+                case_id = result["case_id"]
+                case = by_id.get(case_id)
+                if (case is None or case_id not in manifest["case_ids"] or case_id in completed
+                        or case["total_ranks"] is None
+                        or result.get("status") != "success"
+                        or result.get("group_start") != 0
+                        or result.get("group_end") != case["total_ranks"] - 1):
+                    continue
+                if not dry_run:
+                    append_rows(output_csv, [result_row(case, cfg, result,
+                                payload.get("metadata", {}), run_dir)])
+                completed.add(case_id)
+                print(f"Recovered {case_id} from {checkpoint}", flush=True)
+            if not dry_run and set(manifest["case_ids"]).issubset(by_id):
+                (run_dir / "consumed").touch()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"Cannot recover {checkpoint}: {exc}", file=sys.stderr)
+    return completed
+
+
 def parse_nodes(value):
     nodes = [part.strip() for part in value.split(",") if part.strip()]
     if not nodes:
@@ -175,24 +250,39 @@ def run_launcher(cmd, env, timeout_sec, log_path, case_id):
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                                   start_new_session=True)
-        while process.poll() is None:
-            now = time.monotonic()
-            if now - start >= timeout_sec:
-                print(f"[{case_id}] timeout after {timeout_sec}s; stopping launcher process tree",
-                      flush=True)
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                return 124
-            if now >= next_notice:
-                print(f"[{case_id}] still running ({int(now-start)}s); "
-                      f"live cluster output: {log_path}", flush=True)
-                next_notice = now + 30
-            time.sleep(min(1, max(0.05, next_notice - now)))
-        return process.returncode
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                if now - start >= timeout_sec:
+                    print(f"[{case_id}] timeout after {timeout_sec}s; stopping launcher process tree",
+                          flush=True)
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                    return 124
+                if now >= next_notice:
+                    print(f"[{case_id}] still running ({int(now-start)}s); "
+                          f"live cluster output: {log_path}", flush=True)
+                    next_notice = now + 30
+                time.sleep(min(1, max(0.05, next_notice - now)))
+            return process.returncode
+        except KeyboardInterrupt:
+            print("Interrupted; stopping cluster and collecting checkpoint...", flush=True)
+            # Signal the launcher itself so its EXIT trap can stop container tasks
+            # and copy rank 0's checkpoint before we return to the caller.
+            process.terminate()
+            try:
+                process.wait(timeout=120)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                print("Cleanup interrupted or timed out; checkpoint collection may be incomplete",
+                      file=sys.stderr)
+            raise
+
 
 
 def main():
@@ -203,6 +293,8 @@ def main():
                         help="available node IPs after master; omitted means master only (or HCCL_NODES)")
     parser.add_argument("--launcher", default="./launch_cluster.sh")
     parser.add_argument("--log-dir", default="./hccl_matrix_logs")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="rerun all cases even when successful results exist in output_csv")
     args = parser.parse_args()
     cfg = load_config(args.config)
     nproc = int(os.environ.get("NPROC_PER_NODE", "8"))
@@ -211,7 +303,15 @@ def main():
     nodes = parse_nodes(args.nodes) if args.nodes else []
     available_nodes = len(nodes) + 1
     cases = make_topology_cases(cfg, available_nodes, nproc)
-    batches = group_cases(cases)
+    output_csv = Path(cfg["output_csv"]).expanduser().resolve()
+    log_root = Path(args.log_dir).expanduser().resolve()
+    completed = successful_cases(output_csv, cases, cfg)
+    completed = recover_checkpoints(log_root, output_csv, cases, cfg, completed, args.dry_run)
+    if args.no_resume:
+        completed = set()
+    print(f"Resume: {len(completed)} successful cases skipped; "
+          f"{len(cases) - len(completed)} combinations remaining", flush=True)
+    batches = group_cases([case for case in cases if case["case_id"] not in completed])
     if args.dry_run:
         valid = 0
         for key, batch in batches:
@@ -229,8 +329,6 @@ def main():
               f"planned_launches={sum(any(not validate_case(c, c['total_ranks']) for c in b) for _, b in batches)} "
               f"available_nodes={available_nodes} max_procs_per_node={nproc}")
         return 0
-    output_csv = Path(cfg["output_csv"]).expanduser().resolve()
-    log_root = Path(args.log_dir).expanduser().resolve()
     log_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     stopped = False
@@ -252,9 +350,16 @@ def main():
         while pending:
             attempt += 1
             run_dir = log_root / batch_id / f"attempt_{attempt}"
-            run_dir.mkdir(parents=True, exist_ok=True)
+            while run_dir.exists():
+                attempt += 1
+                run_dir = log_root / batch_id / f"attempt_{attempt}"
+            run_dir.mkdir(parents=True)
             host_result = run_dir / "checkpoint.json"
-            host_result.unlink(missing_ok=True)
+            with (run_dir / "attempt.json").open("w", encoding="utf-8") as stream:
+                json.dump({"output_csv": str(output_csv), "warmup": cfg["warmup"],
+                           "repeat": cfg["repeat"], "case_ids": [c["case_id"] for c in pending]}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
             env = os.environ.copy()
             env.update({"IMAGE_NAME": env.get("IMAGE_NAME", ""),
                 "NPROC_PER_NODE": str(batch_procs), "GROUP_SIZE": str(key[0]),
@@ -285,14 +390,8 @@ def main():
                         if case is None:
                             continue
                         completed.add(case["case_id"])
-                        row = base_row(case, cfg, result.get("status", "failed"), result.get("reason", ""),
-                                       str(run_dir), result.get("group_start", ""), result.get("group_end", ""))
-                        row.update({"input_bytes": result.get("input_bytes", ""),
-                                    "output_bytes": result.get("output_bytes", ""),
-                                    "actual_expansion_mode": result.get("actual_expansion_mode", "unknown")})
-                        row.update(metadata)
-                        row.update(result.get("metrics", {}))
-                        append_rows(output_csv, [row])
+                        append_rows(output_csv, [result_row(case, cfg, result, metadata, run_dir)])
+                    (run_dir / "consumed").touch()
                 if return_code == 0 and payload and payload.get("complete"):
                     break
                 if return_code in (69, 70):
@@ -318,7 +417,10 @@ def main():
                             append_rows(output_csv, [base_row(case, cfg, "failed", reason, str(run_dir))])
                     break
             except KeyboardInterrupt:
-                raise
+                recover_checkpoints(log_root, output_csv, cases, cfg,
+                                    successful_cases(output_csv, cases, cfg))
+                print("Interrupted. Run the same command to resume.", flush=True)
+                return 130
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 diagnostic = traceback.format_exc()
                 (run_dir / "matrix.traceback.log").write_text(diagnostic, encoding="utf-8")

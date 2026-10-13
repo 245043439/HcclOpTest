@@ -3,8 +3,8 @@
 `run_matrix.py` runs the Cartesian product in a JSON file. Cases with the same
 group size, node count, ranks per node, execution mode, expansion mode, and dtype share one distributed
 launch and HCCL communicator; every configured operator and byte size runs in
-order. The CSV is appended after every completed case, so measurements survive
-later failures. All sizes are bytes.
+order. Each completed case is checkpointed; after the launcher exits, its results
+are appended to the CSV, preserving measurements from later batch failures. All sizes are bytes.
 Case IDs and batch log directories use labels such as `g8_n2_p4_group8`
 (8 total ranks, two cluster nodes, four processes per node, communication group
 size 8). Here `g` is total ranks and `group` is communication group size.
@@ -23,6 +23,25 @@ and Docker access configured for `launch_cluster.sh`:
 python3 run_matrix.py --config matrix_config.example.json --dry-run --nodes 10.0.0.2,10.0.0.3
 IMAGE_NAME=my-hccl-image python3 run_matrix.py --config matrix_config.example.json --nodes 10.0.0.2,10.0.0.3
 ```
+
+### 失败后恢复
+
+重新执行相同命令即可默认恢复：运行器读取配置中的 `output_csv`，按 case ID
+（含算子、大小、dtype、执行模式、展开模式和拓扑）、warmup 和 repeat 匹配历史结果。
+只有最新匹配记录为 `success` 且包含完整 rank 范围时才跳过；失败、超时、
+未执行及其他未成功项会重新处理。历史 CSV 保留并追加新的结果，日志使用新的
+attempt 目录。`--dry-run` 也会应用恢复筛选，显示剩余工作量。
+
+需要全量重跑时添加 `--no-resume`。更换机器、容器镜像或软件版本时，请使用新的
+`output_csv` 或添加该选项，因为这些环境变化不参与恢复匹配。
+按一次 Ctrl+C 后，运行器会通知 launcher 清理集群任务，从主节点容器取回
+checkpoint，并将已完成 case 的结果写入 CSV，以退出码 130 退出。
+等待清理完成后重新执行原命令，已完成项会跳过，正在执行但未完成的 case 会重跑。
+启动时还会从同一 `--log-dir` 自动导入尚未处理的 checkpoint；`--dry-run`
+只预览恢复结果，不写文件。每次启动保存参数清单，避免导入其他输出文件或
+warmup/repeat 不匹配的结果。此功能适用于新版生成的带 `attempt.json` 的日志。
+恢复时请保留原 CSV 和日志目录。连续按 Ctrl+C 或清理超时会强制结束清理；
+`kill -9` 不执行清理，尚未取回的容器 checkpoint 不保证能自动恢复。
 
 `--nodes` lists the nodes after the master. The master address comes from
 `MASTER_ADDR` (default `141.61.94.99`). For `run_matrix.py`, `NPROC_PER_NODE`

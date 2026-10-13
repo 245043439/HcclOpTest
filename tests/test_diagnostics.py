@@ -10,6 +10,34 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_cleanup_collects_checkpoint_even_without_run_worker(self):
+        source = (ROOT / "launch_cluster.sh").read_text()
+        cleanup = source.split("\ncleanup() {", 1)[1].split("\non_exit()", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cleanup.sh"
+            script.write_text("""set -eu
+LOG_DIR="$1"
+CASE_RESULT_FILE="$1/checkpoint.json"
+REMOTE_RESULT_FILE=/tmp/container-result.json
+CONTAINER_NAME=test
+WORKER_SCRIPT="$1/worker"
+CLEANING=0
+CLEANUP_STATUS=0
+WATCHDOG_PID=''
+PREPARED=1
+PIDS=()
+NODES=(master)
+invoke() { return 0; }
+docker() {
+    [[ "$1" == cp && "$2" == test:/tmp/container-result.json ]]
+    echo '{"results": []}' > "$3"
+}
+cleanup() {""" + cleanup + "\ncleanup\n")
+            result = subprocess.run(["bash", str(script), directory], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((Path(directory) / "checkpoint.json").read_text(), '{"results": []}\n')
+            self.assertFalse((Path(directory) / "checkpoint.json.tmp").exists())
+
     def test_stale_process_check_ignores_empty_cmdline(self):
         source = (ROOT / 'launch_cluster.sh').read_text()
         worker = source.split("<<'REMOTE_SCRIPT'\n", 1)[1].split('\nREMOTE_SCRIPT\n', 1)[0]
