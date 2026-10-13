@@ -289,8 +289,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="JSON test matrix configuration")
     parser.add_argument("--dry-run", action="store_true", help="list planned combinations only")
-    parser.add_argument("--nodes", default=os.environ.get("HCCL_NODES"),
-                        help="available node IPs after master; omitted means master only (or HCCL_NODES)")
+    parser.add_argument("--nodes", default=os.environ.get("HCCL_NODES") or None,
+                        help="worker IPs to use (all are remote workers; omitted uses local master)")
     parser.add_argument("--launcher", default="./launch_cluster.sh")
     parser.add_argument("--log-dir", default="./hccl_matrix_logs")
     parser.add_argument("--no-resume", action="store_true",
@@ -300,8 +300,9 @@ def main():
     nproc = int(os.environ.get("NPROC_PER_NODE", "8"))
     if nproc <= 0:
         raise ValueError("NPROC_PER_NODE must be positive")
-    nodes = parse_nodes(args.nodes) if args.nodes else []
-    available_nodes = len(nodes) + 1
+    remote_nodes_only = args.nodes is not None
+    nodes = parse_nodes(args.nodes) if remote_nodes_only else []
+    available_nodes = len(nodes) if remote_nodes_only else 1
     cases = make_topology_cases(cfg, available_nodes, nproc)
     output_csv = Path(cfg["output_csv"]).expanduser().resolve()
     log_root = Path(args.log_dir).expanduser().resolve()
@@ -343,7 +344,7 @@ def main():
         if not pending:
             continue
         node_count, batch_procs = key[4], key[5]
-        selected_nodes = nodes[:node_count - 1]
+        selected_nodes = nodes[:node_count] if remote_nodes_only else []
         batch_id = (f"batch_{batch_index:04d}_g{key[0]}_n{node_count}_p{batch_procs}_group{key[0]}_"
                     f"{key[1]}_{key[2]}_{key[3]}")
         attempt = 0
@@ -372,6 +373,7 @@ def main():
                     [{"case_id": c["case_id"], "operator": c["operator"],
                       "size_bytes": c["size_bytes"]} for c in pending], separators=(",", ":")),
                 "CASE_RESULT_FILE": str(host_result),
+                "HCCL_NODES_ONLY": "1" if remote_nodes_only else "0",
                 "BENCH_SCRIPT": env.get("BENCH_SCRIPT", str(Path(__file__).resolve().with_name("run_bench.py")))})
             label = f"{batch_id}/attempt_{attempt}"
             print(f"[{label}] launching {len(pending)} cases; first={pending[0]['case_id']}", flush=True)

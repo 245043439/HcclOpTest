@@ -43,16 +43,16 @@ warmup/repeat 不匹配的结果。此功能适用于新版生成的带 `attempt
 恢复时请保留原 CSV 和日志目录。连续按 Ctrl+C 或清理超时会强制结束清理；
 `kill -9` 不执行清理，尚未取回的容器 checkpoint 不保证能自动恢复。
 
-`--nodes` lists the nodes after the master. The master address comes from
-`MASTER_ADDR` (default `141.61.94.99`). For `run_matrix.py`, `NPROC_PER_NODE`
-is the per-node capacity limit (default 8), not a fixed launch size. All uniform
-placements satisfying `node_count * ranks_per_node == group_size` are enumerated.
-For group 8 with two available nodes and capacity 8, the launches are `(2,4)`
-and `(1,8)`. Each launch runs all configured operators and sizes on its single
-world communicator, without splitting it into subgroups. Nodes are selected in
-input order starting with the master; node subsets and device permutations are
-not enumerated. Omitting `--nodes` uses only the master. The standalone launcher
-still treats `NPROC_PER_NODE` as the actual ranks per node.
+`--nodes` lists the only hosts that run benchmark workers. The command machine
+coordinates the run over SSH and does not need to be a worker. Each listed host
+is addressed as `SSH_USER@IP` (default user `root`); the first listed host is the
+distributed master. `NPROC_PER_NODE` is the per-host capacity (default 8).
+Uniform placements satisfying `node_count * ranks_per_node == group_size` are
+enumerated using only the listed hosts, in input order. For group 8 with two
+listed hosts and capacity 8, launches use `(2,4)` and `(1,8)`. Omitting
+`--nodes` keeps the legacy single-host mode on `MASTER_ADDR` (default
+`141.61.94.99`). The standalone launcher still treats `NPROC_PER_NODE` as the
+actual ranks per node.
 `run_matrix.py` passes this checkout's `run_bench.py` path to the launcher by
 default. The checkout must be visible at the same path on all nodes and inside
 the container; set `BENCH_SCRIPT` to the container-visible path if it differs.

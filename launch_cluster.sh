@@ -22,11 +22,18 @@ MATRIX_SIZE_BYTES="${MATRIX_SIZE_BYTES:-}"
 MATRIX_DTYPE="${MATRIX_DTYPE:-float32}"
 CASE_RESULT_FILE="${CASE_RESULT_FILE:-}"
 MATRIX_CASES_JSON="${MATRIX_CASES_JSON:-}"
+HCCL_NODES_ONLY="${HCCL_NODES_ONLY:-0}"
 
 # With no additional nodes, launch on the master only.
 [[ "$TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo 'TIMEOUT_SEC must be positive integer' >&2; exit 2; }
 
-NODES=("$MASTER_ADDR" "$@")
+if [[ "$HCCL_NODES_ONLY" == 1 ]]; then
+    (( $# > 0 )) || { echo 'HCCL_NODES_ONLY requires at least one --nodes IP' >&2; exit 2; }
+    NODES=("$@")
+    MASTER_ADDR="${NODES[0]}"
+else
+    NODES=("$MASTER_ADDR" "$@")
+fi
 NNODES=${#NODES[@]}
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
 GROUP_SIZE="${GROUP_SIZE:-$WORLD_SIZE}"
@@ -204,7 +211,7 @@ invoke() {
         "$NPROC_PER_NODE" "$SIZE_MB" "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$RUN_ID"
         "$MATRIX_OPERATOR" "$MATRIX_EXECUTION_MODE" "$MATRIX_EXPANSION_MODE" "$MATRIX_SIZE_BYTES"
         "$REMOTE_RESULT_FILE" "$MATRIX_DTYPE" "$MATRIX_CASES_JSON" "$CASE_TIMEOUT_SEC")
-    if (( idx == 0 )); then
+    if (( idx == 0 )) && [[ "$HCCL_NODES_ONLY" != 1 ]]; then
         bash "$WORKER_SCRIPT" "${args[@]}"
     else
         printf -v remote_args '%q ' "${args[@]}"
@@ -239,11 +246,26 @@ cleanup() {
         # The run worker may have been interrupted before copying its result.
         # Container cleanup leaves the atomic rank-0 checkpoint available.
         if [[ -n "$CASE_RESULT_FILE" ]]; then
-            if docker cp "$CONTAINER_NAME:$REMOTE_RESULT_FILE" "$CASE_RESULT_FILE.tmp" \
-                    > "$LOG_DIR/checkpoint_collect.log" 2>&1; then
-                mv "$CASE_RESULT_FILE.tmp" "$CASE_RESULT_FILE"
+            if [[ "$HCCL_NODES_ONLY" == 1 ]]; then
+                printf -v copy_cmd 'docker exec %q cat %q' \
+                    "$CONTAINER_NAME" "$REMOTE_RESULT_FILE"
+                checkpoint_copy=(ssh -T -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+                    -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$SSH_USER@${NODES[0]}" "$copy_cmd")
+                if "${checkpoint_copy[@]}" > "$CASE_RESULT_FILE.tmp" \
+                        2> "$LOG_DIR/checkpoint_collect.log"; then
+                    mv "$CASE_RESULT_FILE.tmp" "$CASE_RESULT_FILE"
+                else
+                    rm -f "$CASE_RESULT_FILE.tmp"
+                    echo "WARNING: checkpoint collection failed; see checkpoint_collect.log" >&2
+                fi
             else
-                echo "WARNING: checkpoint collection failed; see checkpoint_collect.log" >&2
+                checkpoint_copy=(docker cp "$CONTAINER_NAME:$REMOTE_RESULT_FILE" "$CASE_RESULT_FILE.tmp")
+                if "${checkpoint_copy[@]}" > "$LOG_DIR/checkpoint_collect.log" 2>&1; then
+                    mv "$CASE_RESULT_FILE.tmp" "$CASE_RESULT_FILE"
+                else
+                    rm -f "$CASE_RESULT_FILE.tmp"
+                    echo "WARNING: checkpoint collection failed; see checkpoint_collect.log" >&2
+                fi
             fi
         fi
         for idx in "${!NODES[@]}"; do
