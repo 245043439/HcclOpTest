@@ -23,10 +23,7 @@ MATRIX_DTYPE="${MATRIX_DTYPE:-float32}"
 CASE_RESULT_FILE="${CASE_RESULT_FILE:-}"
 MATRIX_CASES_JSON="${MATRIX_CASES_JSON:-}"
 
-if (( $# < 1 )); then
-    echo "Usage: IMAGE_NAME=image bash $0 <node1_ip> [node2_ip ...]" >&2
-    exit 2
-fi
+# With no additional nodes, launch on the master only.
 [[ "$TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || { echo 'TIMEOUT_SEC must be positive integer' >&2; exit 2; }
 
 NODES=("$MASTER_ADDR" "$@")

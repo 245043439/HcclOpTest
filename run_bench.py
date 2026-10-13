@@ -64,18 +64,12 @@ DTYPES = {
 }
 
 
-def create_groups(group_size):
-    rank = dist.get_rank()
+def select_world_group(group_size):
+    """Use the one communicator whose topology was selected by the matrix runner."""
     world_size = dist.get_world_size()
-    if world_size % group_size:
-        raise ValueError("world size must be divisible by group size")
-    selected, selected_start = None, None
-    for start in range(0, world_size, group_size):
-        ranks = list(range(start, start + group_size))
-        group = dist.new_group(ranks=ranks)
-        if rank in ranks:
-            selected, selected_start = group, start
-    return selected, selected_start
+    if world_size != group_size:
+        raise ValueError("group size must equal the launch world size")
+    return dist.group.WORLD, 0
 
 
 def max_latency(local_ms, group, participant_ranks=None):
@@ -240,14 +234,14 @@ def main():
     rank, world_size = dist.get_rank(), dist.get_world_size()
     print(f"[rank {rank}/{world_size}] HCCL process group initialized", flush=True)
     p = args.group_size
-    if p < 2 or p > world_size or world_size % p:
-        raise ValueError("invalid group size for world size")
+    if p < 2 or p != world_size:
+        raise ValueError("group size must be >= 2 and equal launch world size")
     if args.repeat <= 0 or args.warmup < 0:
         raise ValueError("repeat must be positive and warmup nonnegative")
-    STAGE = f"create subgroups size={p}"
-    group, group_start = create_groups(p)
+    STAGE = f"select world communicator size={p}"
+    group, group_start = select_world_group(p)
     group_rank = dist.get_rank(group=group)
-    print(f"[rank {rank}] subgroup creation complete; group_size={p}", flush=True)
+    print(f"[rank {rank}] world communicator ready; group_size={p}", flush=True)
     device, dtype = torch.device(f"npu:{local_rank}"), DTYPES[args.dtype]
     elem_size = torch.empty((), dtype=dtype).element_size()
     if cases is None:

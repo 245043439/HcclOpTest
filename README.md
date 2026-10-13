@@ -1,12 +1,12 @@
 # HCCL communication latency matrix
 
 `run_matrix.py` runs the Cartesian product in a JSON file. Cases with the same
-group size, execution mode, expansion mode, and dtype share one distributed
+group size, node count, ranks per node, execution mode, expansion mode, and dtype share one distributed
 launch and HCCL communicator; every configured operator and byte size runs in
 order. The CSV is appended after every completed case, so measurements survive
 later failures. All sizes are bytes.
 Case IDs and batch log directories use labels such as `g8_n2_p4_group8`
-(16 total ranks, two cluster nodes, eight processes per node, communication group
+(8 total ranks, two cluster nodes, four processes per node, communication group
 size 8). Here `g` is total ranks and `group` is communication group size.
 Set the required tensor dtype with the JSON `dtype` field (the example uses
 `float16`); supported names are `float16`,
@@ -25,15 +25,23 @@ IMAGE_NAME=my-hccl-image python3 run_matrix.py --config matrix_config.example.js
 ```
 
 `--nodes` lists the nodes after the master. The master address comes from
-`MASTER_ADDR` (default `141.61.94.99`). `NPROC_PER_NODE` defaults to 8.
+`MASTER_ADDR` (default `141.61.94.99`). For `run_matrix.py`, `NPROC_PER_NODE`
+is the per-node capacity limit (default 8), not a fixed launch size. All uniform
+placements satisfying `node_count * ranks_per_node == group_size` are enumerated.
+For group 8 with two available nodes and capacity 8, the launches are `(2,4)`
+and `(1,8)`. Each launch runs all configured operators and sizes on its single
+world communicator, without splitting it into subgroups. Nodes are selected in
+input order starting with the master; node subsets and device permutations are
+not enumerated. Omitting `--nodes` uses only the master. The standalone launcher
+still treats `NPROC_PER_NODE` as the actual ranks per node.
 `run_matrix.py` passes this checkout's `run_bench.py` path to the launcher by
 default. The checkout must be visible at the same path on all nodes and inside
 the container; set `BENCH_SCRIPT` to the container-visible path if it differs.
 
 The supported operations are allreduce, alltoall, reducescatter, allgather,
 broadcast, ring batch_send_recv, and unidirectional send_recv from the first to
-last rank of each group. Group sizes must be powers of two and divide world
-size. Invalid combinations are recorded as skipped. On Atlas 350, AIV and
+last rank of each group. Group sizes must be powers of two and equal the world size of each launch.
+Groups without a placement within the available capacity are skipped. Invalid combinations are recorded as skipped. On Atlas 350, AIV and
 CCU_MS are recorded as skipped according to the current HCCL documentation;
 actual expansion selection for other settings is reported as `unknown` because
 HCCL does not expose a portable runtime query for it.
@@ -42,7 +50,7 @@ HCCL does not expose a portable runtime query for it.
 HCCL patch and full graph compilation. `aclgraph` requires the NPU graph APIs
 exposed by the installed torch_npu. Unsupported or failed graph runs are
 recorded; they are never silently measured as eager. `run_matrix.py` records
-one CSV row per case and subgroup, with latency statistics in milliseconds
+one CSV row per case and topology, with latency statistics in milliseconds
 and a status/reason for every skipped or failed case.
 
 The benchmark does not check numerical results. Run an initial small matrix on
@@ -67,7 +75,7 @@ Python 异常会记录完整调用栈、异常链、rank、主机、进程、参
 
 ```bash
 mkdir -p diagnostics
-tar -xf hccl_matrix_logs/<case_id>/node_0.diagnostics.tar -C diagnostics
+tar -xf hccl_matrix_logs/<batch_id>/attempt_1/node_0.diagnostics.tar -C diagnostics
 cat diagnostics/rank_0.traceback.log
 ```
 

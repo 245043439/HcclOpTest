@@ -84,11 +84,29 @@ def make_cases(cfg, node_count=None, nproc_per_node=None):
     return cases
 
 
+def make_topology_cases(cfg, available_nodes, max_procs_per_node):
+    cases = []
+    for group in cfg["group_sizes"]:
+        topologies = [(n, group // n) for n in range(min(available_nodes, max(group, 0)), 0, -1)
+                      if group % n == 0 and 1 <= group // n <= max_procs_per_node]
+        group_cfg = dict(cfg, group_sizes=[group])
+        if not topologies:
+            skipped = make_cases(group_cfg)
+            for case in skipped:
+                case["topology_error"] = (f"no topology for group_size {group} with "
+                    f"{available_nodes} available nodes and at most {max_procs_per_node} ranks per node")
+            cases.extend(skipped)
+        for node_count, procs in topologies:
+            cases.extend(make_cases(group_cfg, node_count, procs))
+    return cases
+
+
 def group_cases(cases):
     groups = {}
     for case in cases:
         key = (case["group_size"], case["execution_mode"],
-               case["expansion_mode"], case["dtype"])
+               case["expansion_mode"], case["dtype"],
+               case["node_count"], case["nproc_per_node"])
         groups.setdefault(key, []).append(case)
     return list(groups.items())
 
@@ -103,8 +121,10 @@ def validate_case(case, world_size):
         return f"size_bytes must be divisible by {dtype} element size ({elem_size})"
     if group < 2 or group & (group - 1):
         return "group_size must be a power of two >= 2"
-    if group > world_size or world_size % group:
-        return f"group_size {group} must divide world size {world_size} and not exceed it"
+    if case.get("topology_error"):
+        return case["topology_error"]
+    if group != world_size:
+        return f"group_size {group} must equal launch world size {world_size}"
     if case["operator"] in {"alltoall", "reducescatter", "allgather"}:
         elems = size // elem_size
         if elems % group:
@@ -180,7 +200,7 @@ def main():
     parser.add_argument("--config", required=True, help="JSON test matrix configuration")
     parser.add_argument("--dry-run", action="store_true", help="list planned combinations only")
     parser.add_argument("--nodes", default=os.environ.get("HCCL_NODES"),
-                        help="comma-separated node IPs after master (or HCCL_NODES)")
+                        help="available node IPs after master; omitted means master only (or HCCL_NODES)")
     parser.add_argument("--launcher", default="./launch_cluster.sh")
     parser.add_argument("--log-dir", default="./hccl_matrix_logs")
     args = parser.parse_args()
@@ -189,29 +209,26 @@ def main():
     if nproc <= 0:
         raise ValueError("NPROC_PER_NODE must be positive")
     nodes = parse_nodes(args.nodes) if args.nodes else []
-    world_size = (len(nodes) + 1) * nproc if nodes else None
-    node_count = len(nodes) + 1 if nodes else None
-    cases = make_cases(cfg, node_count=node_count, nproc_per_node=nproc)
+    available_nodes = len(nodes) + 1
+    cases = make_topology_cases(cfg, available_nodes, nproc)
     batches = group_cases(cases)
     if args.dry_run:
         valid = 0
         for key, batch in batches:
-            reasons = {case["case_id"]: validate_case(case, world_size) if world_size else ""
+            reasons = {case["case_id"]: validate_case(case, case["total_ranks"])
                        for case in batch}
             count = sum(not reason for reason in reasons.values())
             valid += count
-            print(f"batch group={key[0]} mode={key[1]} expansion={key[2]} dtype={key[3]} "
+            print(f"batch group={key[0]} nodes={key[4]} procs_per_node={key[5]} mode={key[1]} expansion={key[2]} dtype={key[3]} "
                   f"launches={1 if count else 0} cases={count}")
             for case in batch:
                 reason = reasons[case["case_id"]]
                 print(f"  {case['case_id']} {case['operator']} size={case['size_bytes']}B"
                       + (f" SKIP: {reason}" if reason else ""))
         print(f"combinations={len(cases)} batches={len(batches)} valid_cases={valid} "
-              f"planned_launches={sum(any(not validate_case(c, world_size) for c in b) for _, b in batches) if world_size else len(batches)} "
-              f"world_size={world_size or 'unknown'}")
+              f"planned_launches={sum(any(not validate_case(c, c['total_ranks']) for c in b) for _, b in batches)} "
+              f"available_nodes={available_nodes} max_procs_per_node={nproc}")
         return 0
-    if not nodes:
-        raise ValueError("execution requires --nodes or HCCL_NODES")
     output_csv = Path(cfg["output_csv"]).expanduser().resolve()
     log_root = Path(args.log_dir).expanduser().resolve()
     log_root.mkdir(parents=True, exist_ok=True)
@@ -220,14 +237,16 @@ def main():
     for batch_index, (key, batch) in enumerate(batches, 1):
         pending = []
         for case in batch:
-            skip = validate_case(case, world_size)
+            skip = validate_case(case, case["total_ranks"])
             if skip:
                 append_rows(output_csv, [base_row(case, cfg, "skipped", skip)])
             else:
                 pending.append(case)
         if not pending:
             continue
-        batch_id = (f"batch_{batch_index:04d}_g{world_size}_n{node_count}_p{nproc}_group{key[0]}_"
+        node_count, batch_procs = key[4], key[5]
+        selected_nodes = nodes[:node_count - 1]
+        batch_id = (f"batch_{batch_index:04d}_g{key[0]}_n{node_count}_p{batch_procs}_group{key[0]}_"
                     f"{key[1]}_{key[2]}_{key[3]}")
         attempt = 0
         while pending:
@@ -238,7 +257,7 @@ def main():
             host_result.unlink(missing_ok=True)
             env = os.environ.copy()
             env.update({"IMAGE_NAME": env.get("IMAGE_NAME", ""),
-                "NPROC_PER_NODE": str(nproc), "GROUP_SIZE": str(key[0]),
+                "NPROC_PER_NODE": str(batch_procs), "GROUP_SIZE": str(key[0]),
                 "WARMUP": str(cfg["warmup"]), "REPEAT": str(cfg["repeat"]),
                 "CASE_TIMEOUT_SEC": str(cfg["case_timeout_sec"]),
                 "TIMEOUT_SEC": str(cfg["case_timeout_sec"] * (len(pending) + 1)),
@@ -252,7 +271,7 @@ def main():
             label = f"{batch_id}/attempt_{attempt}"
             print(f"[{label}] launching {len(pending)} cases; first={pending[0]['case_id']}", flush=True)
             try:
-                return_code = run_launcher(["bash", args.launcher, *nodes], env,
+                return_code = run_launcher(["bash", args.launcher, *selected_nodes], env,
                     int(env["TIMEOUT_SEC"]) + 120,
                     run_dir / "launcher.log", label)
                 payload = None
