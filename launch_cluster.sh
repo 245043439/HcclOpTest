@@ -67,6 +67,14 @@ check_stale() {
 import os, sys
 bench = sys.argv[1]
 found = []
+def is_benchmark_process(parts, bench):
+    if not parts:
+        return False
+    is_torchrun = (any(os.path.basename(arg) in ('torchrun', 'torchrun.exe') for arg in parts[1:])
+                   or os.path.basename(parts[0]) == 'torchrun')
+    is_bench = any(arg == bench or arg.endswith('/run_bench.py') for arg in parts[1:])
+    return is_torchrun or is_bench
+
 for item in os.listdir('/proc'):
     if not item.isdigit() or int(item) == os.getpid():
         continue
@@ -75,9 +83,7 @@ for item in os.listdir('/proc'):
         if not args:
             continue
         parts = [a.decode(errors='replace') for a in args if a]
-        is_torchrun = any(os.path.basename(a) in ('torchrun', 'torchrun.exe') for a in parts[1:]) or os.path.basename(parts[0]) == 'torchrun'
-        is_bench = any(a == bench or a.endswith('/run_bench.py') for a in parts[1:])
-        if is_torchrun or is_bench:
+        if is_benchmark_process(parts, bench):
             found.append((item, ' '.join(parts)[:240]))
     except (OSError, ProcessLookupError):
         pass

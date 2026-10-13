@@ -10,6 +10,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_stale_process_check_ignores_empty_cmdline(self):
+        source = (ROOT / 'launch_cluster.sh').read_text()
+        worker = source.split("<<'REMOTE_SCRIPT'\n", 1)[1].split('\nREMOTE_SCRIPT\n', 1)[0]
+        checker = worker.split("docker exec -i \"$CONTAINER\" python3 - \"$BENCH_SCRIPT\" <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
+        tree = ast.parse(checker)
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'is_benchmark_process')
+        namespace = {'os': os}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'check_stale', 'exec'), namespace)
+        self.assertFalse(namespace['is_benchmark_process']([], 'run_bench.py'))
+        self.assertTrue(namespace['is_benchmark_process'](['python3', 'run_bench.py'], 'run_bench.py'))
+
     def test_launcher_watchdog_tracks_sleep_process_directly(self):
         source = (ROOT / 'launch_cluster.sh').read_text()
         self.assertIn('sleep "$TIMEOUT_SEC" &\nWATCHDOG_PID=$!', source)
