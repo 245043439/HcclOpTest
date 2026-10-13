@@ -10,6 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_launcher_watchdog_tracks_sleep_process_directly(self):
+        source = (ROOT / 'launch_cluster.sh').read_text()
+        self.assertIn('sleep "$TIMEOUT_SEC" &\nWATCHDOG_PID=$!', source)
+        self.assertNotIn('( sleep "$TIMEOUT_SEC"; exit 124 ) &', source)
+
     def test_latency_max_reduction_uses_hccl_supported_float32(self):
         source = (ROOT / 'run_bench.py').read_text()
         tree = ast.parse(source)

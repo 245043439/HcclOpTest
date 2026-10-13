@@ -274,9 +274,9 @@ for i in "${!NODES[@]}"; do
     echo "Started Node $i (${NODES[$i]}), local PID=$!"
 done
 
-# A watchdog is a separate waitable child, so wait -n reports success/failure
-# as soon as any worker finishes, regardless of node index.
-( sleep "$TIMEOUT_SEC"; exit 124 ) &
+# Keep the actual sleep process as the waitable child. Wrapping it in a subshell
+# can orphan sleep during cleanup, leaving its inherited log file open on NFS.
+sleep "$TIMEOUT_SEC" &
 WATCHDOG_PID=$!
 ACTIVE+=("$WATCHDOG_PID")
 
