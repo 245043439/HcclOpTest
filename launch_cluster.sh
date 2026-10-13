@@ -50,6 +50,15 @@ NODE_RANK="$1"; NNODES="$2"; MASTER_ADDR="$3"; MASTER_PORT="$4"
 CONTAINER="$5"; IMAGE="$6"; DOCKER_SCRIPT="$7"; BENCH_SCRIPT="$8"
 NPROC="$9"; SIZE_MB="${10}"; GROUP_SIZE="${11}"; WARMUP="${12}"; REPEAT="${13}"; RUN_ID="${14}"
 OPERATOR="${15}"; EXECUTION_MODE="${16}"; EXPANSION_MODE="${17}"; SIZE_BYTES="${18}"; REMOTE_RESULT="${19}"
+DIAG_DIR="/tmp/hccl_diag_${RUN_ID}"
+worker_error() {
+    local status="$1" line="$2" command="$3" frame=0
+    printf '[Node %s] mode=%s failed exit=%s line=%s command=%s\n' "$NODE_RANK" "$MODE" "$status" "$line" "$command" >&2
+    while caller "$frame"; do frame=$((frame + 1)); done >&2
+}
+trap 'worker_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+# Expansion errors (including nounset) bypass ERR; retain an exit diagnostic too.
+trap 'status=$?; if (( status != 0 )); then printf "[Node %s] mode=%s exited %s; inspect worker.sh and preceding error\n" "$NODE_RANK" "$MODE" "$status" >&2; fi' EXIT
 
 # Python is already required by torchrun. Select only actual python benchmark processes,
 # not grep, the preflight shell, or unrelated Python tasks.
@@ -131,7 +140,10 @@ case "$MODE" in
         ;;
     run)
         echo "[Node $NODE_RANK] Starting benchmark RUN_ID=$RUN_ID"
-        docker exec -e "HCCL_BENCH_RUN_ID=$RUN_ID" "$CONTAINER" bash -lc '
+        docker exec -e "HCCL_BENCH_RUN_ID=$RUN_ID" \
+            -e "HCCL_BENCH_DIAG_DIR=$DIAG_DIR" -e PYTHONUNBUFFERED=1 \
+            -e PYTHONFAULTHANDLER=1 "$CONTAINER" bash -lc '
+            set -Eeuo pipefail
             export HCCL_NPU_SOCKET_PORT_RANGE=auto
             if [[ "$5" == DEFAULT ]]; then unset HCCL_OP_EXPANSION_MODE; else export HCCL_OP_EXPANSION_MODE="$5"; fi
             export MATRIX_EXPANSION_MODE="$5"
@@ -153,6 +165,13 @@ case "$MODE" in
         fi
         echo "[Node $NODE_RANK] Finished"
         ;;
+    collect)
+        if docker exec "$CONTAINER" test -d "$DIAG_DIR"; then
+            docker exec "$CONTAINER" tar -C "$DIAG_DIR" -cf - .
+        else
+            tar -cf - --files-from /dev/null
+        fi
+        ;;
     cleanup)
         cleanup_run
         echo "[Node $NODE_RANK] Cleanup complete"
@@ -160,6 +179,7 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
 REMOTE_SCRIPT
+cp "$WORKER_SCRIPT" "$LOG_DIR/worker.sh"
 
 invoke() {
     local idx="$1" mode="$2" ip="${NODES[$1]}" remote_args
@@ -198,6 +218,11 @@ cleanup() {
             if ! wait "$pid"; then
                 echo "WARNING: cleanup failed for PID=$pid; inspect cleanup logs" >&2
                 CLEANUP_STATUS=1
+            fi
+        done
+        for idx in "${!NODES[@]}"; do
+            if ! invoke "$idx" collect > "$LOG_DIR/node_${idx}.diagnostics.tar" 2> "$LOG_DIR/collect_${idx}.log"; then
+                echo "WARNING: node $idx diagnostic collection failed; see collect_${idx}.log" >&2
             fi
         done
     fi

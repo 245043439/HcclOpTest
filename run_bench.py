@@ -4,7 +4,44 @@ import json
 import os
 import re
 import statistics
+import sys
+import socket
+import traceback
+import faulthandler
 import time
+
+# Install diagnostics before importing torch so import/device initialization failures
+# are captured too. These files are collected from each container by the launcher.
+STAGE = "import torch/torch_npu"
+TRACE_FILE = None
+trace_dir = os.environ.get("HCCL_BENCH_DIAG_DIR")
+if trace_dir:
+    os.makedirs(trace_dir, exist_ok=True)
+    TRACE_FILE = open(os.path.join(trace_dir, f"rank_{os.environ.get('RANK', 'unknown')}.traceback.log"),
+                      "a", buffering=1, encoding="utf-8")
+
+
+def report_exception(exc_type, exc, tb):
+    context = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+               f"host={socket.gethostname()} pid={os.getpid()} "
+               f"run={os.environ.get('HCCL_BENCH_RUN_ID', 'unknown')} "
+               f"rank={os.environ.get('RANK', 'unknown')} "
+               f"local_rank={os.environ.get('LOCAL_RANK', 'unknown')} stage={STAGE}\n"
+               f"arguments={sys.argv[1:]!r}\n")
+    message = context + "".join(traceback.format_exception(exc_type, exc, tb))
+    sys.stderr.write(message)
+    sys.stderr.flush()
+    if TRACE_FILE:
+        TRACE_FILE.write(message)
+        TRACE_FILE.flush()
+
+
+sys.excepthook = report_exception
+faulthandler.enable(file=TRACE_FILE or sys.stderr, all_threads=True)
+stack_interval = int(os.environ.get("HCCL_BENCH_STACK_INTERVAL", "60"))
+if stack_interval > 0:
+    faulthandler.dump_traceback_later(stack_interval, repeat=True,
+                                    file=TRACE_FILE or sys.stderr)
 
 import torch
 import torch_npu  # noqa: F401 - registers the NPU backend
@@ -39,21 +76,35 @@ def max_latency(local_ms, group, participant_ranks=None):
     return value.item()
 
 
-def benchmark(fn, group, warmup, repeat, participants=None, graph_runner=None):
+def benchmark(fn, group, warmup, repeat, participants=None, graph_runner=None,
+              progress_label="", is_group_leader=False):
+    global STAGE
     invoke = graph_runner or fn
-    for _ in range(warmup):
+    if is_group_leader:
+        print(f"[{progress_label}] warmup started ({warmup} iterations)", flush=True)
+    for iteration in range(warmup):
+        STAGE = f"{progress_label} warmup {iteration + 1}/{warmup}"
         invoke()
     torch.npu.synchronize()
     dist.barrier(group=group)
+    if is_group_leader:
+        print(f"[{progress_label}] measurement started ({repeat} iterations)", flush=True)
     samples = []
-    for _ in range(repeat):
+    progress_step = max(1, repeat // 5)
+    for iteration in range(repeat):
+        STAGE = f"{progress_label} iteration {iteration + 1}/{repeat} barrier"
         dist.barrier(group=group)
         torch.npu.synchronize()
+        STAGE = f"{progress_label} iteration {iteration + 1}/{repeat} communication/synchronize"
         start = time.perf_counter()
         invoke()
         torch.npu.synchronize()
         elapsed = (time.perf_counter() - start) * 1000
+        STAGE = f"{progress_label} iteration {iteration + 1}/{repeat} latency reduction"
         samples.append(max_latency(elapsed, group, participants))
+        if is_group_leader and (len(samples) % progress_step == 0 or len(samples) == repeat):
+            print(f"[{progress_label}] progress {len(samples)}/{repeat}; "
+                  f"latest_max_ms={samples[-1]:.3f}", flush=True)
     return {
         "mean_ms": statistics.fmean(samples), "min_ms": min(samples),
         "max_ms": max(samples), "p50_ms": statistics.median(samples),
@@ -136,6 +187,7 @@ def run_operator(op, x, group, p, rank, group_start, group_rank, numel, device):
 
 
 def main():
+    global STAGE
     parser = argparse.ArgumentParser()
     parser.add_argument("--size-mb", type=float)
     parser.add_argument("--size-bytes", type=int)
@@ -149,16 +201,22 @@ def main():
     if (args.size_bytes is None) == (args.size_mb is None):
         parser.error("specify exactly one of --size-bytes or --size-mb")
     local_rank = int(os.environ["LOCAL_RANK"])
+    STAGE = "set NPU device"
     torch.npu.set_device(local_rank)
+    STAGE = "init_process_group(hccl)"
+    print(f"[rank {os.environ.get('RANK')}] {STAGE}", flush=True)
     dist.init_process_group(backend="hccl")
     rank, world_size = dist.get_rank(), dist.get_world_size()
+    print(f"[rank {rank}/{world_size}] HCCL process group initialized", flush=True)
     p = args.group_size
     if p < 2 or p > world_size or world_size % p:
         raise ValueError("invalid group size for world size")
     if args.repeat <= 0 or args.warmup < 0:
         raise ValueError("repeat must be positive and warmup nonnegative")
+    STAGE = f"create subgroups size={p}"
     group, group_start = create_groups(p)
     group_rank = dist.get_rank(group=group)
+    print(f"[rank {rank}] subgroup creation complete; group_size={p}", flush=True)
     device, dtype = torch.device(f"npu:{local_rank}"), torch.float32
     size_bytes = args.size_bytes if args.size_bytes is not None else round(args.size_mb * 1024**2)
     if size_bytes <= 0 or size_bytes % torch.empty((), dtype=dtype).element_size():
@@ -166,8 +224,16 @@ def main():
     numel = size_bytes // torch.empty((), dtype=dtype).element_size()
     op_list = args.operator or list(OPS[:5])
     requested_expansion = os.environ.get("MATRIX_EXPANSION_MODE", "DEFAULT")
-    results = []
-    for op in op_list:
+    # Each rank writes its subgroup result into a fixed numeric row. Gathering
+    # tensors avoids backend/version-dependent Python object collectives.
+    result_width = 8
+    result_tensor = torch.zeros((len(op_list), result_width), device=device,
+                                dtype=torch.float64)
+    for op_index, op in enumerate(op_list):
+        if group_rank == 0:
+            print(f"[case] op={op} size_bytes={size_bytes} group_size={p} "
+                  f"execution_mode={args.execution_mode} "
+                  f"expansion_mode={requested_expansion} preparing", flush=True)
         # AllGather input follows the legacy total-output-size convention.
         if op == "allgather":
             if numel % p:
@@ -177,27 +243,44 @@ def main():
         x = torch.ones(numel, device=device, dtype=dtype)
         fn, in_elems, out_elems, participants = run_operator(
             op, x, group, p, rank, group_start, group_rank, numel, device)
-        try:
-            run_fn = graph_callable(fn, args.execution_mode)
-            metrics = benchmark(run_fn, group, args.warmup, args.repeat, participants)
-            status, reason = "success", ""
-        except Exception as exc:
-            metrics, status, reason = {}, "failed", f"{type(exc).__name__}: {exc}"
-            # Keep all ranks in a consistent communicator teardown path.
-            dist.barrier(group=group)
+        STAGE = f"op={op} mode={args.execution_mode} graph preparation"
+        run_fn = graph_callable(fn, args.execution_mode)
+        metrics = benchmark(run_fn, group, args.warmup, args.repeat, participants,
+                            progress_label=f"op={op} group={group_start}:{group_start+p-1}",
+                            is_group_leader=(group_rank == 0))
+        status, reason = "success", ""
         if group_rank == 0:
-            results.append({
-                "operator": op, "group_start": group_start,
-                "group_end": group_start + p - 1,
-                "input_bytes": in_elems * 4, "output_bytes": out_elems * 4,
-                "metrics": metrics, "status": status, "reason": reason,
-                "requested_expansion_mode": requested_expansion,
-                "actual_expansion_mode": "unknown",
-            })
-    gathered = [None] * world_size
-    dist.all_gather_object(gathered, results if group_rank == 0 else None)
+            metric_values = [metrics.get(key, 0.0) for key in
+                             ("mean_ms", "min_ms", "max_ms", "p50_ms", "p95_ms")]
+            result_tensor[op_index] = torch.tensor(
+                [in_elems * 4, out_elems * 4, *metric_values,
+                 1.0 if status == "success" else 2.0],
+                device=device, dtype=torch.float64)
+    print(f"[rank {rank}] benchmark operations complete; gathering subgroup results",
+          flush=True)
+    gathered_tensors = [torch.empty_like(result_tensor) for _ in range(world_size)]
+    STAGE = "gather subgroup results"
+    dist.all_gather(gathered_tensors, result_tensor)
+    print(f"[rank {rank}] subgroup result gathering complete", flush=True)
     if rank == 0 and args.result_json:
-        all_results = [item for group_results in gathered if group_results for item in group_results]
+        all_results = []
+        for group_leader in range(0, world_size, p):
+            values = gathered_tensors[group_leader].cpu().tolist()
+            for op_index, op in enumerate(op_list):
+                row = values[op_index]
+                success = row[7] == 1.0
+                all_results.append({
+                    "operator": op, "group_start": group_leader,
+                    "group_end": group_leader + p - 1,
+                    "input_bytes": int(row[0]), "output_bytes": int(row[1]),
+                    "metrics": ({"mean_ms": row[2], "min_ms": row[3],
+                                 "max_ms": row[4], "p50_ms": row[5],
+                                 "p95_ms": row[6]} if success else {}),
+                    "status": "success" if success else "failed",
+                    "reason": "" if success else "benchmark failed; see rank logs",
+                    "requested_expansion_mode": requested_expansion,
+                    "actual_expansion_mode": "unknown",
+                })
         props = torch.npu.get_device_properties(local_rank)
         metadata = {
             "hardware": getattr(props, "name", "unknown"),
@@ -226,7 +309,10 @@ def main():
                    "metadata": metadata, "results": all_results}
         with open(args.result_json, "w", encoding="utf-8") as stream:
             json.dump(payload, stream)
+        print(f"[rank 0] structured results written to {args.result_json}", flush=True)
+    STAGE = "destroy process group"
     dist.destroy_process_group()
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

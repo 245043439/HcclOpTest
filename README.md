@@ -40,3 +40,26 @@ The benchmark does not check numerical results. Run an initial small matrix on
 the target A5/CANN stack before expanding sizes and group counts; this local
 environment does not include NPU dependencies, so real measurements must be
 collected on the target cluster.
+
+## 异常与卡住诊断
+
+运行器实时写入每个用例目录下的 `launcher.log`，每 30 秒提示等待时间。
+节点的完整标准输出和错误输出保存在 `node_0.log`、`node_1.log` 等文件。
+Python 异常会记录完整调用栈、异常链、rank、主机、进程、参数和当前阶段，
+随后退出当前分布式任务；异常后不再执行 barrier。
+
+每个 rank 还会单独保存 `rank_<全局rank>.traceback.log`，默认每 60 秒记录
+一次所有 Python 线程的当前栈，帮助定位没有抛异常的阻塞。这种定时栈快照
+本身不代表执行失败。任务结束或清理后，启动器从各容器收集这些文件到
+`node_<节点编号>.diagnostics.tar`，无需共享输出目录。例如：
+
+```bash
+mkdir -p diagnostics
+tar -xf hccl_matrix_logs/<case_id>/node_0.diagnostics.tar -C diagnostics
+cat diagnostics/rank_0.traceback.log
+```
+
+Shell 命令失败会记录节点、阶段、退出码、命令和调用位置；展开未定义变量
+产生的错误保留原始错误信息和退出记录。用例目录的 `worker.sh` 保存实际
+执行的 worker 脚本，可按错误行号定位。诊断文件收集失败时查看
+`collect_<节点编号>.log`。运行器自身的用例异常保存在 `matrix.traceback.log`。

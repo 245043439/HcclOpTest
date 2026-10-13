@@ -6,9 +6,11 @@ import itertools
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
+import traceback
 
 
 OPS = {"allreduce", "alltoall", "reducescatter", "allgather",
@@ -120,6 +122,33 @@ def parse_nodes(value):
     return nodes
 
 
+def run_launcher(cmd, env, timeout_sec, log_path, case_id):
+    """Stream launcher output to disk while keeping the operator informed."""
+    start = time.monotonic()
+    next_notice = start + 30
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                  start_new_session=True)
+        while process.poll() is None:
+            now = time.monotonic()
+            if now - start >= timeout_sec:
+                print(f"[{case_id}] timeout after {timeout_sec}s; stopping launcher process tree",
+                      flush=True)
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                return 124
+            if now >= next_notice:
+                print(f"[{case_id}] still running ({int(now-start)}s); "
+                      f"live cluster output: {log_path}", flush=True)
+                next_notice = now + 30
+            time.sleep(min(1, max(0.05, next_notice - now)))
+        return process.returncode
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="JSON test matrix configuration")
@@ -176,14 +205,14 @@ def main():
                 "BENCH_SCRIPT": env.get("BENCH_SCRIPT", str(Path(__file__).resolve().with_name("run_bench.py"))),
             })
             cmd = ["bash", args.launcher, *nodes]
-            completed = subprocess.run(cmd, env=env, text=True, capture_output=True,
-                                       timeout=cfg["case_timeout_sec"] + 120)
-            (case_log_dir / "launcher.stdout.log").write_text(completed.stdout, encoding="utf-8")
-            (case_log_dir / "launcher.stderr.log").write_text(completed.stderr, encoding="utf-8")
-            if completed.returncode != 0:
-                status = "timeout" if completed.returncode == 124 else "failed"
+            print(f"[{case['case_id']}] launcher log: {case_log_dir / 'launcher.log'}", flush=True)
+            return_code = run_launcher(
+                cmd, env, cfg["case_timeout_sec"] + 120,
+                case_log_dir / "launcher.log", case["case_id"])
+            if return_code != 0:
+                status = "timeout" if return_code == 124 else "failed"
                 rows = [base_row(case, cfg, status,
-                                 f"launcher exited {completed.returncode}", str(case_log_dir))]
+                                 f"launcher exited {return_code}", str(case_log_dir))]
             elif not host_result.exists():
                 rows = [base_row(case, cfg, "failed", "launcher completed without structured result file",
                                  str(case_log_dir))]
@@ -204,16 +233,16 @@ def main():
                 if not rows:
                     rows = [base_row(case, cfg, "failed", "empty structured result", str(case_log_dir))]
             append_rows(output_csv, rows)
-            if completed.returncode in (69, 70):
+            if return_code in (69, 70):
                 for remaining in cases[index:]:
                     append_rows(output_csv, [base_row(
                         remaining, cfg, "not_run",
                         "cluster preflight or cleanup failed; stopped matrix")])
                 break
-        except subprocess.TimeoutExpired:
-            append_rows(output_csv, [base_row(case, cfg, "timeout", "launcher exceeded case timeout",
-                                               str(case_log_dir))])
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            diagnostic = traceback.format_exc()
+            (case_log_dir / "matrix.traceback.log").write_text(diagnostic, encoding="utf-8")
+            print(diagnostic, file=sys.stderr, flush=True)
             append_rows(output_csv, [base_row(case, cfg, "failed", str(exc), str(case_log_dir))])
         except KeyboardInterrupt:
             append_rows(output_csv, [base_row(case, cfg, "failed", "interrupted by user", str(case_log_dir))])
@@ -228,5 +257,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (ValueError, OSError, json.JSONDecodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(2)
