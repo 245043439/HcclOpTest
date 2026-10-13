@@ -53,7 +53,8 @@ def load_config(path):
     cfg.setdefault("repeat", 50)
     cfg.setdefault("case_timeout_sec", 900)
     cfg.setdefault("output_csv", "./results.csv")
-    cfg.setdefault("dtype", "float32")
+    if "dtype" not in cfg:
+        raise ValueError("missing config key: dtype")
     if cfg["dtype"] not in DTYPE_SIZES:
         raise ValueError(f"unsupported dtype {cfg['dtype']!r}; choose one of {sorted(DTYPE_SIZES)}")
     if cfg["warmup"] < 0 or cfg["repeat"] <= 0 or cfg["case_timeout_sec"] <= 0:

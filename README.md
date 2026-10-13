@@ -5,7 +5,8 @@ group size, execution mode, expansion mode, and dtype share one distributed
 launch and HCCL communicator; every configured operator and byte size runs in
 order. The CSV is appended after every completed case, so measurements survive
 later failures. All sizes are bytes.
-Set the tensor dtype with the JSON `dtype` field; supported names are `float16`,
+Set the required tensor dtype with the JSON `dtype` field (the example uses
+`float16`); supported names are `float16`,
 `float32`, `bfloat16`, `int8`, `uint8`, `int16`, `int32`, and `int64`. HCCL
 support for a dtype can vary by operation, product and CANN version, so runtime
 rejections appear as failed cases in the CSV.

@@ -19,7 +19,7 @@ class BatchingTests(unittest.TestCase):
         path = Path(directory) / "config.json"
         path.write_text(json.dumps({
             "operators": ["allreduce", "broadcast"],
-            "sizes_bytes": [16, 32], "group_sizes": [2],
+            "sizes_bytes": [16, 32], "dtype": "float16", "group_sizes": [2],
             "execution_modes": ["eager"], "expansion_modes": ["DEFAULT"],
             "warmup": 0, "repeat": 1, "case_timeout_sec": 1,
             "output_csv": str(Path(directory) / "results.csv"),
@@ -33,6 +33,16 @@ class BatchingTests(unittest.TestCase):
         self.assertEqual([(c["operator"], c["size_bytes"]) for c in batches[0][1]],
                          [("allreduce", 16), ("allreduce", 32),
                           ("broadcast", 16), ("broadcast", 32)])
+
+    def test_dtype_is_required_and_taken_from_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = json.loads(self.config(directory).read_text())
+            self.assertEqual(matrix.make_cases(config)[0]["dtype"], "float16")
+            del config["dtype"]
+            path = Path(directory) / "missing_dtype.json"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "missing config key: dtype"):
+                matrix.load_config(path)
 
     def test_failed_case_checkpoint_resumes_only_remaining_cases(self):
         with tempfile.TemporaryDirectory() as directory:
