@@ -69,7 +69,7 @@ def create_groups(group_size):
 def max_latency(local_ms, group, participant_ranks=None):
     rank = dist.get_rank()
     selected = participant_ranks is None or rank in participant_ranks
-    value = torch.tensor([local_ms if selected else 0.0], device="npu", dtype=torch.float64)
+    value = torch.tensor([local_ms if selected else 0.0], device="npu", dtype=torch.float32)
     # For point-to-point, mask ranks that do not transfer data, then reduce across
     # the existing group; this avoids creating a new communicator per iteration.
     dist.all_reduce(value, op=dist.ReduceOp.MAX, group=group)
@@ -228,7 +228,7 @@ def main():
     # tensors avoids backend/version-dependent Python object collectives.
     result_width = 8
     result_tensor = torch.zeros((len(op_list), result_width), device=device,
-                                dtype=torch.float64)
+                                dtype=torch.float32)
     for op_index, op in enumerate(op_list):
         if group_rank == 0:
             print(f"[case] op={op} size_bytes={size_bytes} group_size={p} "
@@ -255,7 +255,7 @@ def main():
             result_tensor[op_index] = torch.tensor(
                 [in_elems * 4, out_elems * 4, *metric_values,
                  1.0 if status == "success" else 2.0],
-                device=device, dtype=torch.float64)
+                device=device, dtype=torch.float32)
     print(f"[rank {rank}] benchmark operations complete; gathering subgroup results",
           flush=True)
     gathered_tensors = [torch.empty_like(result_tensor) for _ in range(world_size)]

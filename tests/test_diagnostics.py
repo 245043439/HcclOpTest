@@ -1,5 +1,6 @@
 """Exercise failure logging without torch, Docker or an NPU."""
 import os
+import ast
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_latency_max_reduction_uses_hccl_supported_float32(self):
+        source = (ROOT / 'run_bench.py').read_text()
+        tree = ast.parse(source)
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'max_latency')
+
+        class Tensor:
+            def item(self):
+                return 1.25
+
+        class FakeTorch:
+            float32 = object()
+            observed_dtype = None
+
+            @classmethod
+            def tensor(cls, values, **kwargs):
+                cls.observed_dtype = kwargs['dtype']
+                return Tensor()
+
+        class FakeDist:
+            class ReduceOp:
+                MAX = object()
+
+            @staticmethod
+            def get_rank():
+                return 0
+
+            @staticmethod
+            def all_reduce(*args, **kwargs):
+                return None
+
+        namespace = {'torch': FakeTorch, 'dist': FakeDist}
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     str(ROOT / 'run_bench.py'), 'exec'), namespace)
+        result = namespace['max_latency'](1.25, object())
+        self.assertEqual(result, 1.25)
+        self.assertIs(FakeTorch.observed_dtype, FakeTorch.float32)
+
     def test_nonleader_initialization_exception_keeps_chained_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
