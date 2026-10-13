@@ -9,6 +9,8 @@ import socket
 import traceback
 import faulthandler
 import time
+import gc
+import subprocess
 
 # Install diagnostics before importing torch so import/device initialization failures
 # are captured too. These files are collected from each container by the launcher.
@@ -50,6 +52,16 @@ import torch.distributed as dist
 
 OPS = ("allreduce", "alltoall", "reducescatter", "allgather",
        "batch_send_recv", "broadcast", "send_recv")
+DTYPES = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
+}
 
 
 def create_groups(group_size):
@@ -191,15 +203,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--size-mb", type=float)
     parser.add_argument("--size-bytes", type=int)
+    parser.add_argument("--cases-json", help="ordered JSON list of case_id/operator/size_bytes cases")
     parser.add_argument("--group-size", type=int, required=True)
+    parser.add_argument("--dtype", choices=DTYPES, default="float32")
     parser.add_argument("--operator", choices=OPS, action="append")
     parser.add_argument("--execution-mode", choices=("eager", "ascend_ir", "aclgraph"), default="eager")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--result-json")
     args = parser.parse_args()
-    if (args.size_bytes is None) == (args.size_mb is None):
-        parser.error("specify exactly one of --size-bytes or --size-mb")
+    if args.cases_json:
+        if args.size_bytes is not None or args.size_mb is not None or args.operator:
+            parser.error("--cases-json cannot be combined with --size-bytes, --size-mb, or --operator")
+        try:
+            cases = json.loads(args.cases_json)
+            if not isinstance(cases, list) or not cases:
+                raise ValueError("must be a nonempty list")
+            for case in cases:
+                if (not isinstance(case, dict) or not isinstance(case.get("case_id"), str)
+                        or case.get("operator") not in OPS
+                        or not isinstance(case.get("size_bytes"), int)
+                        or isinstance(case.get("size_bytes"), bool)):
+                    raise ValueError("each case requires case_id, supported operator, and integer size_bytes")
+        except (ValueError, TypeError) as exc:
+            parser.error(f"invalid --cases-json: {exc}")
+    else:
+        cases = None
+        if (args.size_bytes is None) == (args.size_mb is None):
+            parser.error("specify exactly one of --size-bytes or --size-mb")
     local_rank = int(os.environ["LOCAL_RANK"])
     STAGE = "set NPU device"
     torch.npu.set_device(local_rank)
@@ -217,21 +248,67 @@ def main():
     group, group_start = create_groups(p)
     group_rank = dist.get_rank(group=group)
     print(f"[rank {rank}] subgroup creation complete; group_size={p}", flush=True)
-    device, dtype = torch.device(f"npu:{local_rank}"), torch.float32
-    size_bytes = args.size_bytes if args.size_bytes is not None else round(args.size_mb * 1024**2)
-    if size_bytes <= 0 or size_bytes % torch.empty((), dtype=dtype).element_size():
-        raise ValueError("size must be positive and divisible by float32 element size")
-    numel = size_bytes // torch.empty((), dtype=dtype).element_size()
-    op_list = args.operator or list(OPS[:5])
+    device, dtype = torch.device(f"npu:{local_rank}"), DTYPES[args.dtype]
+    elem_size = torch.empty((), dtype=dtype).element_size()
+    if cases is None:
+        size_bytes = args.size_bytes if args.size_bytes is not None else round(args.size_mb * 1024**2)
+        cases = [{"case_id": "legacy", "operator": op, "size_bytes": size_bytes}
+                 for op in (args.operator or list(OPS[:5]))]
     requested_expansion = os.environ.get("MATRIX_EXPANSION_MODE", "DEFAULT")
-    # Each rank writes its subgroup result into a fixed numeric row. Gathering
-    # tensors avoids backend/version-dependent Python object collectives.
-    result_width = 8
-    result_tensor = torch.zeros((len(op_list), result_width), device=device,
-                                dtype=torch.float32)
-    for op_index, op in enumerate(op_list):
+    metadata = {"hardware": getattr(torch.npu.get_device_properties(local_rank), "name", "unknown"),
+                "cann_version": os.environ.get("CANN_VERSION", "unknown"),
+                "torch_version": torch.__version__,
+                "torch_npu_version": getattr(torch_npu, "__version__", "unknown"),
+                "torchair_version": "unknown"}
+    try:
+        import torchair
+        metadata["torchair_version"] = getattr(torchair, "__version__", "unknown")
+    except ImportError:
+        pass
+    if metadata["cann_version"] == "unknown":
+        for version_file in ("/usr/local/Ascend/ascend-toolkit/latest/version.cfg",
+                             "/usr/local/Ascend/latest/version.cfg"):
+            try:
+                with open(version_file, encoding="utf-8") as stream:
+                    match = re.search(r"(?m)^Version=(.+)$", stream.read())
+                if match:
+                    metadata["cann_version"] = match.group(1).strip()
+                    break
+            except OSError:
+                continue
+    all_results = []
+    checkpoint_path = os.environ.get("CASE_RESULT_FILE") or args.result_json
+    case_timeout = int(os.environ.get("CASE_TIMEOUT_SEC", "0"))
+    timeout_watchdog = None
+
+    def save_checkpoint(current_case, complete=False):
+        if rank != 0 or not checkpoint_path:
+            return
+        payload = {"world_size": world_size, "group_size": p, "metadata": metadata,
+                   "results": all_results, "current_case_id": current_case,
+                   "complete": complete}
+        temp_path = checkpoint_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, checkpoint_path)
+
+    for case in cases:
+        op, size_bytes = case["operator"], case["size_bytes"]
+        case_id = case["case_id"]
+        if size_bytes <= 0 or size_bytes % elem_size:
+            raise ValueError(f"case {case_id}: size must be positive and divisible by {args.dtype} element size ({elem_size})")
+        numel = size_bytes // elem_size
+        save_checkpoint(case_id)
+        if case_timeout > 0:
+            marker = os.path.join(trace_dir or "/tmp", f"timeout_rank_{rank}")
+            timeout_watchdog = subprocess.Popen([sys.executable, "-c",
+                "import os,signal,sys,time; time.sleep(int(sys.argv[1])); "
+                "open(sys.argv[2],'w').write('timeout'); os.kill(int(sys.argv[3]),signal.SIGKILL)",
+                str(case_timeout), marker, str(os.getpid())])
         if group_rank == 0:
-            print(f"[case] op={op} size_bytes={size_bytes} group_size={p} "
+            print(f"[case] case_id={case_id} op={op} size_bytes={size_bytes} group_size={p} "
                   f"execution_mode={args.execution_mode} "
                   f"expansion_mode={requested_expansion} preparing", flush=True)
         # AllGather input follows the legacy total-output-size convention.
@@ -243,72 +320,43 @@ def main():
         x = torch.ones(numel, device=device, dtype=dtype)
         fn, in_elems, out_elems, participants = run_operator(
             op, x, group, p, rank, group_start, group_rank, numel, device)
-        STAGE = f"op={op} mode={args.execution_mode} graph preparation"
+        STAGE = f"case_id={case_id} op={op} size_bytes={size_bytes} mode={args.execution_mode} graph preparation"
         run_fn = graph_callable(fn, args.execution_mode)
         metrics = benchmark(run_fn, group, args.warmup, args.repeat, participants,
-                            progress_label=f"op={op} group={group_start}:{group_start+p-1}",
+                            progress_label=f"case_id={case_id} op={op} size={size_bytes} group={group_start}:{group_start+p-1}",
                             is_group_leader=(group_rank == 0))
-        status, reason = "success", ""
-        if group_rank == 0:
-            metric_values = [metrics.get(key, 0.0) for key in
-                             ("mean_ms", "min_ms", "max_ms", "p50_ms", "p95_ms")]
-            result_tensor[op_index] = torch.tensor(
-                [in_elems * 4, out_elems * 4, *metric_values,
-                 1.0 if status == "success" else 2.0],
-                device=device, dtype=torch.float32)
-    print(f"[rank {rank}] benchmark operations complete; gathering subgroup results",
-          flush=True)
-    gathered_tensors = [torch.empty_like(result_tensor) for _ in range(world_size)]
-    STAGE = "gather subgroup results"
-    dist.all_gather(gathered_tensors, result_tensor)
-    print(f"[rank {rank}] subgroup result gathering complete", flush=True)
-    if rank == 0 and args.result_json:
-        all_results = []
-        for group_leader in range(0, world_size, p):
-            values = gathered_tensors[group_leader].cpu().tolist()
-            for op_index, op in enumerate(op_list):
-                row = values[op_index]
-                success = row[7] == 1.0
-                all_results.append({
-                    "operator": op, "group_start": group_leader,
+        values = [metrics.get(key, 0.0) for key in ("mean_ms", "min_ms", "max_ms", "p50_ms", "p95_ms")]
+        local = torch.tensor(values, device=device, dtype=torch.float32)
+        gathered = [torch.empty_like(local) for _ in range(world_size)]
+        STAGE = f"case_id={case_id} gather subgroup results"
+        dist.all_gather(gathered, local)
+        if rank == 0:
+            for group_leader in range(0, world_size, p):
+                row = gathered[group_leader].cpu().tolist()
+                all_results.append({"case_id": case_id, "operator": op,
+                    "size_bytes": size_bytes, "group_start": group_leader,
                     "group_end": group_leader + p - 1,
-                    "input_bytes": int(row[0]), "output_bytes": int(row[1]),
-                    "metrics": ({"mean_ms": row[2], "min_ms": row[3],
-                                 "max_ms": row[4], "p50_ms": row[5],
-                                 "p95_ms": row[6]} if success else {}),
-                    "status": "success" if success else "failed",
-                    "reason": "" if success else "benchmark failed; see rank logs",
+                    "input_bytes": size_bytes // p if op == "allgather" else size_bytes,
+                    "output_bytes": size_bytes // p if op == "reducescatter" else size_bytes,
+                    "metrics": dict(zip(("mean_ms", "min_ms", "max_ms", "p50_ms", "p95_ms"), row)),
+                    "status": "success", "reason": "",
                     "requested_expansion_mode": requested_expansion,
-                    "actual_expansion_mode": "unknown",
-                })
-        props = torch.npu.get_device_properties(local_rank)
-        metadata = {
-            "hardware": getattr(props, "name", "unknown"),
-            "cann_version": os.environ.get("CANN_VERSION", "unknown"),
-            "torch_version": torch.__version__,
-            "torch_npu_version": getattr(torch_npu, "__version__", "unknown"),
-            "torchair_version": "unknown",
-        }
-        try:
-            import torchair
-            metadata["torchair_version"] = getattr(torchair, "__version__", "unknown")
-        except ImportError:
-            pass
-        if metadata["cann_version"] == "unknown":
-            for version_file in ("/usr/local/Ascend/ascend-toolkit/latest/version.cfg",
-                                 "/usr/local/Ascend/latest/version.cfg"):
-                try:
-                    content = open(version_file, encoding="utf-8").read()
-                    match = re.search(r"(?m)^Version=(.+)$", content)
-                    if match:
-                        metadata["cann_version"] = match.group(1).strip()
-                        break
-                except OSError:
-                    continue
-        payload = {"world_size": world_size, "group_size": p,
-                   "metadata": metadata, "results": all_results}
-        with open(args.result_json, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream)
+                    "actual_expansion_mode": "unknown"})
+            save_checkpoint(None)
+        dist.barrier()
+        del x, fn, run_fn, metrics, local, gathered
+        if op in ("alltoall", "reducescatter", "allgather", "batch_send_recv", "send_recv"):
+            del participants
+        torch.npu.synchronize()
+        gc.collect()
+        if timeout_watchdog:
+            timeout_watchdog.terminate()
+            timeout_watchdog.wait()
+            timeout_watchdog = None
+    if rank == 0:
+        save_checkpoint(None, complete=True)
+    print(f"[rank {rank}] benchmark cases complete", flush=True)
+    if rank == 0 and args.result_json:
         print(f"[rank 0] structured results written to {args.result_json}", flush=True)
     STAGE = "destroy process group"
     dist.destroy_process_group()

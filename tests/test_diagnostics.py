@@ -53,6 +53,14 @@ class DiagnosticsTests(unittest.TestCase):
             temp = Path(directory)
             (temp / 'torch').mkdir()
             (temp / 'torch' / '__init__.py').write_text('''
+float16 = object()
+float32 = object()
+bfloat16 = object()
+int8 = object()
+int16 = object()
+int32 = object()
+int64 = object()
+uint8 = object()
 class NPU:
     def set_device(self, device):
         try:
@@ -89,7 +97,7 @@ npu = NPU()
             docker.chmod(0o755)
             args = ['run', '1', '2', '127.0.0.1', '29600', 'test-container', 'test-image',
                     'docker-gen.sh', 'run_bench.py', '8', '1', '2', '0', '1', 'test-run',
-                    'allreduce', 'eager', 'DEFAULT', '1024', '/tmp/test-result.json']
+                    'allreduce', 'eager', 'DEFAULT', '1024', '/tmp/test-result.json', 'float32']
             env = dict(os.environ, PATH=str(temp) + os.pathsep + os.environ['PATH'])
             result = subprocess.run(['bash', str(temp / 'worker.sh'), *args], env=env,
                                     capture_output=True, text=True, timeout=10)

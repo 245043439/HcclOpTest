@@ -13,12 +13,15 @@ WARMUP="${WARMUP:-10}"
 REPEAT="${REPEAT:-50}"
 SSH_USER="${SSH_USER:-root}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-900}"
+CASE_TIMEOUT_SEC="${CASE_TIMEOUT_SEC:-$TIMEOUT_SEC}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 MATRIX_OPERATOR="${MATRIX_OPERATOR:-}"
 MATRIX_EXECUTION_MODE="${MATRIX_EXECUTION_MODE:-eager}"
 MATRIX_EXPANSION_MODE="${MATRIX_EXPANSION_MODE:-DEFAULT}"
 MATRIX_SIZE_BYTES="${MATRIX_SIZE_BYTES:-}"
+MATRIX_DTYPE="${MATRIX_DTYPE:-float32}"
 CASE_RESULT_FILE="${CASE_RESULT_FILE:-}"
+MATRIX_CASES_JSON="${MATRIX_CASES_JSON:-}"
 
 if (( $# < 1 )); then
     echo "Usage: IMAGE_NAME=image bash $0 <node1_ip> [node2_ip ...]" >&2
@@ -49,7 +52,7 @@ MODE="$1"; shift
 NODE_RANK="$1"; NNODES="$2"; MASTER_ADDR="$3"; MASTER_PORT="$4"
 CONTAINER="$5"; IMAGE="$6"; DOCKER_SCRIPT="$7"; BENCH_SCRIPT="$8"
 NPROC="$9"; SIZE_MB="${10}"; GROUP_SIZE="${11}"; WARMUP="${12}"; REPEAT="${13}"; RUN_ID="${14}"
-OPERATOR="${15}"; EXECUTION_MODE="${16}"; EXPANSION_MODE="${17}"; SIZE_BYTES="${18}"; REMOTE_RESULT="${19}"
+OPERATOR="${15}"; EXECUTION_MODE="${16}"; EXPANSION_MODE="${17}"; SIZE_BYTES="${18}"; REMOTE_RESULT="${19}"; DTYPE="${20}"; CASES_JSON="${21:-}"; TIMEOUT_SEC="${22:-900}"
 DIAG_DIR="/tmp/hccl_diag_${RUN_ID}"
 worker_error() {
     local status="$1" line="$2" command="$3" frame=0
@@ -140,29 +143,39 @@ case "$MODE" in
         ;;
     run)
         echo "[Node $NODE_RANK] Starting benchmark RUN_ID=$RUN_ID"
-        docker exec -e "HCCL_BENCH_RUN_ID=$RUN_ID" \
+        set +e
+        docker exec -e "HCCL_BENCH_RUN_ID=$RUN_ID" -e "CASE_TIMEOUT_SEC=$TIMEOUT_SEC" \
             -e "HCCL_BENCH_DIAG_DIR=$DIAG_DIR" -e PYTHONUNBUFFERED=1 \
             -e PYTHONFAULTHANDLER=1 "$CONTAINER" bash -lc '
             set -Eeuo pipefail
             export HCCL_NPU_SOCKET_PORT_RANGE=auto
             if [[ "$5" == DEFAULT ]]; then unset HCCL_OP_EXPANSION_MODE; else export HCCL_OP_EXPANSION_MODE="$5"; fi
             export MATRIX_EXPANSION_MODE="$5"
-            size_args=(--size-mb "$9")
-            [[ -z "${10}" ]] || size_args=(--size-bytes "${10}")
-            op_args=()
-            [[ -z "$4" ]] || op_args=(--operator "$4")
+            size_args=()
+            case_args=()
+            if [[ -n "${17}" ]]; then case_args=(--cases-json "${17}"); else
+                size_args=(--size-mb "$9")
+                [[ -z "${10}" ]] || size_args=(--size-bytes "${10}")
+                [[ -z "$4" ]] || case_args=(--operator "$4")
+            fi
             exec torchrun \
                 --nnodes="$1" --node_rank="$2" --nproc_per_node="$3" \
                 --master_addr="$6" --master_port="$7" \
                 "$8" "${size_args[@]}" --group-size "${11}" \
                 --warmup "${12}" --repeat "${13}" \
-                --execution-mode "${14}" "${op_args[@]}" --result-json "${15}"
+                --execution-mode "${14}" "${case_args[@]}" --result-json "${15}" --dtype "${16}"
         ' bash "$NNODES" "$NODE_RANK" "$NPROC" "$OPERATOR" "$EXPANSION_MODE" \
           "$MASTER_ADDR" "$MASTER_PORT" "$BENCH_SCRIPT" "$SIZE_MB" "$SIZE_BYTES" \
-          "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$EXECUTION_MODE" "$REMOTE_RESULT"
-        if (( NODE_RANK == 0 )) && [[ -n "${CASE_RESULT_FILE:-}" ]]; then
-            docker cp "$CONTAINER:$REMOTE_RESULT" "$CASE_RESULT_FILE"
+          "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$EXECUTION_MODE" "$REMOTE_RESULT" "$DTYPE" "$CASES_JSON"
+        run_status=$?
+        set -e
+        if docker exec "$CONTAINER" bash -lc "compgen -G '$DIAG_DIR/timeout_rank_*' >/dev/null"; then
+            run_status=124
         fi
+        if (( NODE_RANK == 0 )) && [[ -n "${CASE_RESULT_FILE:-}" ]]; then
+            docker cp "$CONTAINER:$REMOTE_RESULT" "$CASE_RESULT_FILE" || true
+        fi
+        (( run_status == 0 )) || exit "$run_status"
         echo "[Node $NODE_RANK] Finished"
         ;;
     collect)
@@ -187,7 +200,7 @@ invoke() {
         "$CONTAINER_NAME" "$IMAGE_NAME" "$DOCKER_SCRIPT" "$BENCH_SCRIPT"
         "$NPROC_PER_NODE" "$SIZE_MB" "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$RUN_ID"
         "$MATRIX_OPERATOR" "$MATRIX_EXECUTION_MODE" "$MATRIX_EXPANSION_MODE" "$MATRIX_SIZE_BYTES"
-        "$REMOTE_RESULT_FILE")
+        "$REMOTE_RESULT_FILE" "$MATRIX_DTYPE" "$MATRIX_CASES_JSON" "$CASE_TIMEOUT_SEC")
     if (( idx == 0 )); then
         bash "$WORKER_SCRIPT" "${args[@]}"
     else
@@ -295,7 +308,7 @@ while (( ${#ACTIVE[@]} > 1 )); do
     if (( status != 0 )); then
         echo "[Node $node] FAILED (exit=$status)" >&2
         tail -n 30 "$LOG_DIR/node_${node}.log" >&2 || true
-        exit 1
+        exit "$status"
     fi
     echo "[Node $node] SUCCESS"
     next=()
