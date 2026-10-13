@@ -71,11 +71,15 @@ def make_cases(cfg, node_count=None, nproc_per_node=None):
                 "execution_mode": execution, "expansion_mode": expansion}
         data["node_count"] = node_count
         data["nproc_per_node"] = nproc_per_node
+        total_ranks = (node_count * nproc_per_node
+                       if node_count is not None and nproc_per_node is not None else None)
+        data["total_ranks"] = total_ranks
         canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
         digest = __import__("hashlib").sha256(canonical.encode()).hexdigest()[:12]
         nodes_label = node_count if node_count is not None else "x"
         procs_label = nproc_per_node if nproc_per_node is not None else "x"
-        data["case_id"] = f"g{group}_n{nodes_label}_p{procs_label}_{digest}"
+        ranks_label = total_ranks if total_ranks is not None else "x"
+        data["case_id"] = f"g{ranks_label}_n{nodes_label}_p{procs_label}_group{group}_{digest}"
         cases.append(data)
     return cases
 
@@ -223,7 +227,7 @@ def main():
                 pending.append(case)
         if not pending:
             continue
-        batch_id = (f"batch_{batch_index:04d}_g{key[0]}_n{node_count}_p{nproc}_"
+        batch_id = (f"batch_{batch_index:04d}_g{world_size}_n{node_count}_p{nproc}_group{key[0]}_"
                     f"{key[1]}_{key[2]}_{key[3]}")
         attempt = 0
         while pending:

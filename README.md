@@ -5,8 +5,9 @@ group size, execution mode, expansion mode, and dtype share one distributed
 launch and HCCL communicator; every configured operator and byte size runs in
 order. The CSV is appended after every completed case, so measurements survive
 later failures. All sizes are bytes.
-Case IDs and batch log directories include topology labels such as `g8_n2_p4`
-(group size 8, two cluster nodes, four processes per node).
+Case IDs and batch log directories use labels such as `g8_n2_p4_group8`
+(16 total ranks, two cluster nodes, eight processes per node, communication group
+size 8). Here `g` is total ranks and `group` is communication group size.
 Set the required tensor dtype with the JSON `dtype` field (the example uses
 `float16`); supported names are `float16`,
 `float32`, `bfloat16`, `int8`, `uint8`, `int16`, `int32`, and `int64`. HCCL

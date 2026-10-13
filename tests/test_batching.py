@@ -48,7 +48,7 @@ class BatchingTests(unittest.TestCase):
         cfg = matrix.load_config(self.config(tempfile.mkdtemp()))
         cfg["group_sizes"] = [8]
         case = matrix.make_cases(cfg, node_count=2, nproc_per_node=4)[0]
-        self.assertTrue(case["case_id"].startswith("g8_n2_p4_"), case["case_id"])
+        self.assertTrue(case["case_id"].startswith("g8_n2_p4_group8_"), case["case_id"])
 
     def test_failed_case_checkpoint_resumes_only_remaining_cases(self):
         with tempfile.TemporaryDirectory() as directory:
