@@ -62,15 +62,20 @@ def load_config(path):
     return cfg
 
 
-def make_cases(cfg):
+def make_cases(cfg, node_count=None, nproc_per_node=None):
     combos = itertools.product(cfg["operators"], cfg["sizes_bytes"], cfg["group_sizes"],
                                cfg["execution_modes"], cfg["expansion_modes"])
     cases = []
     for op, size, group, execution, expansion in combos:
         data = {"operator": op, "size_bytes": size, "dtype": cfg["dtype"], "group_size": group,
                 "execution_mode": execution, "expansion_mode": expansion}
+        data["node_count"] = node_count
+        data["nproc_per_node"] = nproc_per_node
         canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
-        data["case_id"] = __import__("hashlib").sha256(canonical.encode()).hexdigest()[:12]
+        digest = __import__("hashlib").sha256(canonical.encode()).hexdigest()[:12]
+        nodes_label = node_count if node_count is not None else "x"
+        procs_label = nproc_per_node if nproc_per_node is not None else "x"
+        data["case_id"] = f"g{group}_n{nodes_label}_p{procs_label}_{digest}"
         cases.append(data)
     return cases
 
@@ -181,7 +186,8 @@ def main():
         raise ValueError("NPROC_PER_NODE must be positive")
     nodes = parse_nodes(args.nodes) if args.nodes else []
     world_size = (len(nodes) + 1) * nproc if nodes else None
-    cases = make_cases(cfg)
+    node_count = len(nodes) + 1 if nodes else None
+    cases = make_cases(cfg, node_count=node_count, nproc_per_node=nproc)
     batches = group_cases(cases)
     if args.dry_run:
         valid = 0
@@ -217,7 +223,8 @@ def main():
                 pending.append(case)
         if not pending:
             continue
-        batch_id = f"batch_{batch_index:04d}_g{key[0]}_{key[1]}_{key[2]}_{key[3]}"
+        batch_id = (f"batch_{batch_index:04d}_g{key[0]}_n{node_count}_p{nproc}_"
+                    f"{key[1]}_{key[2]}_{key[3]}")
         attempt = 0
         while pending:
             attempt += 1
