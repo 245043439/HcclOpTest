@@ -14,6 +14,11 @@ REPEAT="${REPEAT:-50}"
 SSH_USER="${SSH_USER:-root}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-900}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
+MATRIX_OPERATOR="${MATRIX_OPERATOR:-}"
+MATRIX_EXECUTION_MODE="${MATRIX_EXECUTION_MODE:-eager}"
+MATRIX_EXPANSION_MODE="${MATRIX_EXPANSION_MODE:-DEFAULT}"
+MATRIX_SIZE_BYTES="${MATRIX_SIZE_BYTES:-}"
+CASE_RESULT_FILE="${CASE_RESULT_FILE:-}"
 
 if (( $# < 1 )); then
     echo "Usage: IMAGE_NAME=image bash $0 <node1_ip> [node2_ip ...]" >&2
@@ -26,6 +31,7 @@ NNODES=${#NODES[@]}
 WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
 GROUP_SIZE="${GROUP_SIZE:-$WORLD_SIZE}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)_$$_${RANDOM}"
+REMOTE_RESULT_FILE="/tmp/hccl_result_${RUN_ID}_node.json"
 LOG_DIR="${LOG_DIR:-./hccl_logs/$RUN_ID}"
 mkdir -p "$LOG_DIR"
 WORKER_SCRIPT="$(mktemp)"
@@ -33,6 +39,7 @@ PIDS=()
 ACTIVE=()
 PREPARED=0
 CLEANING=0
+CLEANUP_STATUS=0
 WATCHDOG_PID=''
 
 cat > "$WORKER_SCRIPT" <<'REMOTE_SCRIPT'
@@ -42,6 +49,7 @@ MODE="$1"; shift
 NODE_RANK="$1"; NNODES="$2"; MASTER_ADDR="$3"; MASTER_PORT="$4"
 CONTAINER="$5"; IMAGE="$6"; DOCKER_SCRIPT="$7"; BENCH_SCRIPT="$8"
 NPROC="$9"; SIZE_MB="${10}"; GROUP_SIZE="${11}"; WARMUP="${12}"; REPEAT="${13}"; RUN_ID="${14}"
+OPERATOR="${15}"; EXECUTION_MODE="${16}"; EXPANSION_MODE="${17}"; SIZE_BYTES="${18}"; REMOTE_RESULT="${19}"
 
 # Python is already required by torchrun. Select only actual python benchmark processes,
 # not grep, the preflight shell, or unrelated Python tasks.
@@ -125,13 +133,24 @@ case "$MODE" in
         echo "[Node $NODE_RANK] Starting benchmark RUN_ID=$RUN_ID"
         docker exec -e "HCCL_BENCH_RUN_ID=$RUN_ID" "$CONTAINER" bash -lc '
             export HCCL_NPU_SOCKET_PORT_RANGE=auto
+            if [[ "$5" == DEFAULT ]]; then unset HCCL_OP_EXPANSION_MODE; else export HCCL_OP_EXPANSION_MODE="$5"; fi
+            export MATRIX_EXPANSION_MODE="$5"
+            size_args=(--size-mb "$9")
+            [[ -z "${10}" ]] || size_args=(--size-bytes "${10}")
+            op_args=()
+            [[ -z "$4" ]] || op_args=(--operator "$4")
             exec torchrun \
                 --nnodes="$1" --node_rank="$2" --nproc_per_node="$3" \
-                --master_addr="$4" --master_port="$5" \
-                "$6" --size-mb "$7" --group-size "$8" \
-                --warmup "$9" --repeat "${10}"
-        ' bash "$NNODES" "$NODE_RANK" "$NPROC" "$MASTER_ADDR" "$MASTER_PORT" \
-          "$BENCH_SCRIPT" "$SIZE_MB" "$GROUP_SIZE" "$WARMUP" "$REPEAT"
+                --master_addr="$6" --master_port="$7" \
+                "$8" "${size_args[@]}" --group-size "${11}" \
+                --warmup "${12}" --repeat "${13}" \
+                --execution-mode "${14}" "${op_args[@]}" --result-json "${15}"
+        ' bash "$NNODES" "$NODE_RANK" "$NPROC" "$MATRIX_OPERATOR" "$MATRIX_EXPANSION_MODE" \
+          "$MASTER_ADDR" "$MASTER_PORT" "$BENCH_SCRIPT" "$SIZE_MB" "$MATRIX_SIZE_BYTES" \
+          "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$MATRIX_EXECUTION_MODE" "$REMOTE_RESULT_FILE"
+        if (( NODE_RANK == 0 )) && [[ -n "${CASE_RESULT_FILE:-}" ]]; then
+            docker cp "$CONTAINER:$REMOTE_RESULT" "$CASE_RESULT_FILE"
+        fi
         echo "[Node $NODE_RANK] Finished"
         ;;
     cleanup)
@@ -146,7 +165,9 @@ invoke() {
     local idx="$1" mode="$2" ip="${NODES[$1]}" remote_args
     local args=("$mode" "$idx" "$NNODES" "$MASTER_ADDR" "$MASTER_PORT"
         "$CONTAINER_NAME" "$IMAGE_NAME" "$DOCKER_SCRIPT" "$BENCH_SCRIPT"
-        "$NPROC_PER_NODE" "$SIZE_MB" "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$RUN_ID")
+        "$NPROC_PER_NODE" "$SIZE_MB" "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$RUN_ID"
+        "$MATRIX_OPERATOR" "$MATRIX_EXECUTION_MODE" "$MATRIX_EXPANSION_MODE" "$MATRIX_SIZE_BYTES"
+        "$REMOTE_RESULT_FILE")
     if (( idx == 0 )); then
         bash "$WORKER_SCRIPT" "${args[@]}"
     else
@@ -173,11 +194,22 @@ cleanup() {
             ( invoke "$idx" cleanup > "$LOG_DIR/cleanup_${idx}.log" 2>&1 ) &
             cpids+=("$!")
         done
-        for pid in "${cpids[@]}"; do wait "$pid" || echo "WARNING: cleanup failed for PID=$pid; inspect cleanup logs" >&2; done
+        for pid in "${cpids[@]}"; do
+            if ! wait "$pid"; then
+                echo "WARNING: cleanup failed for PID=$pid; inspect cleanup logs" >&2
+                CLEANUP_STATUS=1
+            fi
+        done
     fi
     rm -f "$WORKER_SCRIPT"
 }
-trap cleanup EXIT
+on_exit() {
+    local status=$?
+    cleanup
+    if (( CLEANUP_STATUS != 0 )); then exit 70; fi
+    exit "$status"
+}
+trap on_exit EXIT
 trap 'echo "Interrupted" >&2; exit 130' INT
 trap 'echo "Terminated" >&2; exit 143' TERM
 trap 'echo "Hangup" >&2; exit 129' HUP
@@ -194,7 +226,7 @@ for i in "${!NODES[@]}"; do
     if ! invoke "$i" prepare > "$LOG_DIR/prepare_${i}.log" 2>&1; then
         echo "Preflight FAILED on Node $i:" >&2
         tail -n 30 "$LOG_DIR/prepare_${i}.log" >&2
-        exit 1
+        exit 69
     fi
     echo "[Node $i] READY"
 done
