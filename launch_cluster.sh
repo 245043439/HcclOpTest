@@ -145,9 +145,9 @@ case "$MODE" in
                 "$8" "${size_args[@]}" --group-size "${11}" \
                 --warmup "${12}" --repeat "${13}" \
                 --execution-mode "${14}" "${op_args[@]}" --result-json "${15}"
-        ' bash "$NNODES" "$NODE_RANK" "$NPROC" "$MATRIX_OPERATOR" "$MATRIX_EXPANSION_MODE" \
-          "$MASTER_ADDR" "$MASTER_PORT" "$BENCH_SCRIPT" "$SIZE_MB" "$MATRIX_SIZE_BYTES" \
-          "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$MATRIX_EXECUTION_MODE" "$REMOTE_RESULT_FILE"
+        ' bash "$NNODES" "$NODE_RANK" "$NPROC" "$OPERATOR" "$EXPANSION_MODE" \
+          "$MASTER_ADDR" "$MASTER_PORT" "$BENCH_SCRIPT" "$SIZE_MB" "$SIZE_BYTES" \
+          "$GROUP_SIZE" "$WARMUP" "$REPEAT" "$EXECUTION_MODE" "$REMOTE_RESULT"
         if (( NODE_RANK == 0 )) && [[ -n "${CASE_RESULT_FILE:-}" ]]; then
             docker cp "$CONTAINER:$REMOTE_RESULT" "$CASE_RESULT_FILE"
         fi
