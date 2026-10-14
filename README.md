@@ -66,6 +66,16 @@ CCU_MS are recorded as skipped according to the current HCCL documentation;
 actual expansion selection for other settings is reported as `unknown` because
 HCCL does not expose a portable runtime query for it.
 
+检查指定节点上的 NPU 使用和进程：
+
+```bash
+python3 query_npu_usage.py --nodes 141.61.94.111,141.61.94.112
+```
+
+脚本通过 SSH 在每个节点执行 `npu-smi info`，输出设备利用率、显存和占用进程表；
+SSH 用户默认为 `SSH_USER` 环境变量或 `root`，可用 `--ssh-user` 覆盖。需要控制机
+可以免密 SSH 登录这些节点。
+
 `eager` uses direct PyTorch distributed calls. `ascend_ir` requires TorchAir's
 HCCL patch and full graph compilation. `aclgraph` requires the NPU graph APIs
 exposed by the installed torch_npu. Unsupported or failed graph runs are
