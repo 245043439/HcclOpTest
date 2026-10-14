@@ -5,10 +5,12 @@ import csv
 import itertools
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -26,6 +28,10 @@ FIELDS = [
     "status", "reason", "log_path", "hardware", "cann_version", "torch_version",
     "torch_npu_version", "torchair_version",
 ]
+LEGACY_FIELDS = FIELDS[:]
+ENDPOINT_FIELDS = LEGACY_FIELDS + ["source_rank", "target_rank", "rank_stride"]
+FIELDS = [field for field in LEGACY_FIELDS if field not in {"rank_start", "rank_end"}]
+FIELDS.insert(5, "rank_list")
 
 
 def load_config(path):
@@ -53,6 +59,10 @@ def load_config(path):
     cfg.setdefault("repeat", 50)
     cfg.setdefault("case_timeout_sec", 900)
     cfg.setdefault("output_csv", "./results.csv")
+    cfg.setdefault("rank_stride", 8)
+    if (not isinstance(cfg["rank_stride"], int) or isinstance(cfg["rank_stride"], bool)
+            or cfg["rank_stride"] <= 0):
+        raise ValueError("rank_stride must be a positive integer")
     if "dtype" not in cfg:
         raise ValueError("missing config key: dtype")
     if cfg["dtype"] not in DTYPE_SIZES:
@@ -138,7 +148,8 @@ def validate_case(case, world_size):
 def base_row(case, cfg, status, reason="", log_path="", start="", end=""):
     return {"case_id": case["case_id"], "operator": case["operator"],
             "size_bytes": case["size_bytes"], "dtype": case["dtype"],
-            "group_size": case["group_size"], "rank_start": start, "rank_end": end,
+            "group_size": case["group_size"],
+            "rank_list": json.dumps(global_ranks(case, cfg, start, end)),
             "execution_mode": case["execution_mode"],
             "requested_expansion_mode": case["expansion_mode"],
             "actual_expansion_mode": "unknown", "input_bytes": "", "output_bytes": "",
@@ -149,9 +160,65 @@ def base_row(case, cfg, status, reason="", log_path="", start="", end=""):
             "torch_npu_version": "", "torchair_version": ""}
 
 
+def global_ranks(case, cfg, start="", end=""):
+    """Map the communicator's dense ranks to global physical slot numbers."""
+    procs = case["nproc_per_node"]
+    if not procs or not case["total_ranks"]:
+        return []
+    stride = cfg.get("rank_stride", 8)
+    if procs > stride:
+        raise ValueError("rank_stride must be at least the number of processes per node")
+    first = 0 if start == "" else int(start)
+    last = case["total_ranks"] - 1 if end == "" else int(end)
+    return [(r // procs) * stride + r % procs for r in range(first, last + 1)]
+
+
+def legacy_rank_list(row):
+    """Old case IDs encode placement; never guess an unknown placement."""
+    match = re.search(r"_n([0-9]+)_p([0-9]+)_", row.get("case_id", ""))
+    if not match or not row.get("rank_start") or not row.get("rank_end"):
+        return []
+    try:
+        nodes, procs = map(int, match.groups())
+        return global_ranks({"nproc_per_node": procs, "total_ranks": nodes * procs},
+                            {"rank_stride": int(row.get("rank_stride") or 8)},
+                            row["rank_start"], row["rank_end"])
+    except (ValueError, TypeError):
+        return []
+
+
+def upgrade_csv(path):
+    """Preserve existing results while converting an old CSV to rank_list."""
+    temp_path = None
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            if reader.fieldnames == FIELDS:
+                return
+            if reader.fieldnames not in (LEGACY_FIELDS, ENDPOINT_FIELDS):
+                raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
+            with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8",
+                                             dir=path.parent, delete=False) as target:
+                temp_path = Path(target.name)
+                writer = csv.DictWriter(target, fieldnames=FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for row in reader:
+                    row["rank_list"] = json.dumps(legacy_rank_list(row))
+                    writer.writerow(row)
+                target.flush()
+                os.fsync(target.fileno())
+        os.chmod(temp_path, path.stat().st_mode & 0o777)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def append_rows(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists() and path.stat().st_size > 0
+    if exists:
+        upgrade_csv(path)
     with path.open("a", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS, extrasaction="ignore")
         if not exists:
@@ -169,7 +236,7 @@ def successful_cases(path, cases, cfg):
     completed = set()
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
-        if reader.fieldnames != FIELDS:
+        if reader.fieldnames not in (FIELDS, LEGACY_FIELDS, ENDPOINT_FIELDS):
             raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
         for row in reader:
             case_id = row.get("case_id")
@@ -177,12 +244,20 @@ def successful_cases(path, cases, cfg):
             if case is None or (row.get("warmup"), row.get("repeat")) != (
                     str(cfg["warmup"]), str(cfg["repeat"])):
                 continue
+            if "rank_list" in row:
+                try:
+                    ranks_match = json.loads(row["rank_list"]) == global_ranks(case, cfg)
+                except (TypeError, ValueError):
+                    ranks_match = False
+            else:
+                ranks_match = (row.get("rank_start") == "0"
+                               and row.get("rank_end") == str(case["total_ranks"] - 1)
+                               if case["total_ranks"] is not None else False)
             # The latest matching attempt wins, including a later failed rerun.
             completed.discard(case_id)
             if (None not in row and all(value is not None for value in row.values())
                     and row["status"] == "success" and case["total_ranks"] is not None
-                    and row["rank_start"] == "0"
-                    and row["rank_end"] == str(case["total_ranks"] - 1)):
+                    and ranks_match):
                 completed.add(case_id)
     return completed
 
@@ -304,6 +379,8 @@ def main():
     nodes = parse_nodes(args.nodes) if remote_nodes_only else []
     available_nodes = len(nodes) if remote_nodes_only else 1
     cases = make_topology_cases(cfg, available_nodes, nproc)
+    if any(c["nproc_per_node"] and c["nproc_per_node"] > cfg["rank_stride"] for c in cases):
+        raise ValueError("rank_stride must be at least the number of processes per node")
     output_csv = Path(cfg["output_csv"]).expanduser().resolve()
     log_root = Path(args.log_dir).expanduser().resolve()
     completed = successful_cases(output_csv, cases, cfg)
@@ -325,6 +402,7 @@ def main():
             for case in batch:
                 reason = reasons[case["case_id"]]
                 print(f"  {case['case_id']} {case['operator']} size={case['size_bytes']}B"
+                      + f" rank_list={global_ranks(case, cfg)}"
                       + (f" SKIP: {reason}" if reason else ""))
         print(f"combinations={len(cases)} batches={len(batches)} valid_cases={valid} "
               f"planned_launches={sum(any(not validate_case(c, c['total_ranks']) for c in b) for _, b in batches)} "
