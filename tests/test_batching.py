@@ -199,6 +199,21 @@ while true; do sleep 0.1 & wait $!; done
                         ValueError, "size_scale_factors"):
                     matrix.load_config(path)
 
+    def test_size_expansion_caps_sizes_at_eight_gib(self):
+        cap = 8 * 1024 ** 3
+        self.assertEqual(matrix.expand_sizes([cap // 2], [2, 4]),
+                         [cap // 2, cap // 4, cap // 8, cap])
+        self.assertEqual(matrix.expand_sizes([cap], [2]), [cap, cap // 2])
+        self.assertEqual(matrix.expand_sizes([cap + 1], []), [])
+
+    def test_allgather_limit_applies_to_group_output_size(self):
+        case = {"operator": "allgather", "size_bytes": 2 * 1024 ** 3,
+                "group_size": 8, "dtype": "float16", "expansion_mode": "DEFAULT"}
+        self.assertEqual(matrix.validate_case(case, 8),
+                         "allgather output size exceeds 8 GiB limit")
+        case["group_size"] = 4
+        self.assertEqual(matrix.validate_case(case, 4), "")
+
     def test_large_case_lists_are_split_under_environment_limit(self):
         cases = [{"case_id": f"case_{index:04d}", "operator": "allreduce",
                   "size_bytes": index + 1} for index in range(20)]

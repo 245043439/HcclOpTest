@@ -22,6 +22,7 @@ EXPANSIONS = {"DEFAULT", "AI_CPU", "CCU_SCHED", "CCU_MS", "AIV"}
 DTYPE_SIZES = {"float16": 2, "float32": 4, "bfloat16": 2,
                "int8": 1, "uint8": 1, "int16": 2, "int32": 4, "int64": 8}
 MAX_CASES_JSON_BYTES = 64 * 1024
+MAX_SIZE_BYTES = 8 * 1024 ** 3
 FIELDS = [
     "case_id", "operator", "size_bytes", "dtype", "group_size", "rank_start", "rank_end",
     "execution_mode", "requested_expansion_mode", "actual_expansion_mode", "input_bytes",
@@ -112,7 +113,7 @@ def expand_sizes(sizes_bytes, factors):
         candidates.extend(size // factor for factor in factors if size % factor == 0)
         candidates.extend(size * factor for factor in factors)
         for candidate in candidates:
-            if candidate not in seen:
+            if candidate <= MAX_SIZE_BYTES and candidate not in seen:
                 seen.add(candidate)
                 expanded.append(candidate)
     return expanded
@@ -175,6 +176,10 @@ def validate_case(case, world_size):
     size, group = case["size_bytes"], case["group_size"]
     if size <= 0:
         return "size_bytes must be positive"
+    output_size = size * group if case["operator"] == "allgather" else size
+    if output_size > MAX_SIZE_BYTES:
+        measured = "allgather output size" if case["operator"] == "allgather" else "size_bytes"
+        return f"{measured} exceeds 8 GiB limit"
     dtype = case["dtype"]
     elem_size = DTYPE_SIZES[dtype]
     if size % elem_size:

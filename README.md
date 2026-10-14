@@ -17,7 +17,9 @@ The optional `size_scale_factors` field expands every `sizes_bytes` entry by
 each configured power-of-two factor: divisible sizes are also divided by the
 factor, and every size is multiplied by it. The original size is retained;
 non-integer byte divisions are skipped, and duplicate sizes are emitted once
-in first-seen order. Leave the field out or set it to `[]` to disable expansion.
+in first-seen order. Sizes above 8 GiB are omitted. The 8 GiB limit is also
+checked per case; for `allgather`, it applies to the output size after scaling
+by `group_size`. Leave the field out or set it to `[]` to disable expansion.
 
 ## Run
 
