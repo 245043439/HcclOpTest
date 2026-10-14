@@ -8,6 +8,13 @@ import shlex
 import subprocess
 import sys
 
+SSH_LOGIN_BANNER = "Authorized users only. All activities may be monitored and reported."
+
+
+def remove_login_banner(output):
+    return "\n".join(line for line in output.splitlines()
+                      if line.strip() != SSH_LOGIN_BANNER)
+
 
 def query_node(ip, ssh_user, connect_timeout, command_timeout):
     destination = f"{ssh_user}@{ip}"
@@ -111,19 +118,48 @@ def main():
     if args.connect_timeout <= 0 or args.timeout <= 0:
         parser.error("timeouts must be positive")
 
-    failed = False
     with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
         results = list(pool.map(lambda ip: query_node(
             ip, args.ssh_user, args.connect_timeout, args.timeout), nodes))
+
+    groups = {"有进程": [], "无进程": [], "无法判断": []}
+    processed = []
     for ip, status, stdout, stderr in results:
-        print(f"===== {ip} | {'OK' if status == 0 else f'FAILED ({status})'} =====")
-        if args.verbose and stdout:
-            print(stdout, end="" if stdout.endswith("\n") else "\n")
-        if stderr:
-            print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
-        print_process_summary(status, stdout, show_processes=args.verbose)
-        failed |= status != 0
-    return 1 if failed else 0
+        stdout = remove_login_banner(stdout)
+        stderr = remove_login_banner(stderr)
+        if status == 0:
+            summary, processes = summarize_processes(stdout)
+        else:
+            summary, processes = "无法判断", []
+        group = summary if summary in ("有进程", "无进程") else "无法判断"
+        groups[group].append(ip)
+        processed.append((ip, status, stdout, stderr, summary, processes))
+
+    for group in ("有进程", "无进程", "无法判断"):
+        if not groups[group]:
+            continue
+        print(f"{group}（{len(groups[group])} 个节点）")
+        for ip in groups[group]:
+            print(f"  {ip}")
+
+    for ip, status, stdout, stderr, summary, processes in processed:
+        if status == 0 and summary != "无法判断（未识别到进程表或明确的空进程提示）":
+            continue
+        if not args.verbose and (status != 0 or summary.startswith("无法判断")):
+            reason = stderr.strip() or summary
+            if reason:
+                print(f"  {ip}：{reason}", file=sys.stderr)
+
+    if args.verbose:
+        for ip, status, stdout, stderr, summary, _ in processed:
+            print(f"===== {ip} | {'OK' if status == 0 else f'FAILED ({status})'} =====")
+            if stdout:
+                print(stdout, end="" if stdout.endswith("\n") else "\n")
+            if stderr:
+                print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
+            print_process_summary(status, stdout, show_processes=True)
+
+    return 1 if any(status != 0 for _, status, *_ in processed) else 0
 
 
 if __name__ == "__main__":

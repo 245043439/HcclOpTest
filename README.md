@@ -87,7 +87,7 @@ python3 scripts/python/query_npu_usage.py --nodes 141.61.94.111,141.61.94.112
 脚本通过 SSH 在每个节点执行 `npu-smi info`，输出设备利用率、显存和占用进程表；
 SSH 用户默认为 `SSH_USER` 环境变量或 `root`，可用 `--ssh-user` 覆盖。需要控制机
 可以免密 SSH 登录这些节点。
-默认只显示每个节点是否有 NPU 进程占用；需要查看完整 `npu-smi info` 输出和进程明细时，添加 `--verbose`。
+默认按“有进程”“无进程”和“无法判断”分组显示节点；需要查看完整 `npu-smi info` 输出和进程明细时，添加 `--verbose`。SSH 登录横幅会自动过滤。
 
 `eager` uses direct PyTorch distributed calls. `ascend_ir` requires TorchAir's
 HCCL patch and full graph compilation. `aclgraph` requires the NPU graph APIs
