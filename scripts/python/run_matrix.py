@@ -366,7 +366,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="list planned combinations only")
     parser.add_argument("--nodes", default=os.environ.get("HCCL_NODES") or None,
                         help="worker IPs to use (all are remote workers; omitted uses local master)")
-    parser.add_argument("--launcher", default="./launch_cluster.sh")
+    parser.add_argument("--launcher", default="./scripts/shell/launch_cluster.sh")
     parser.add_argument("--log-dir", default="./hccl_matrix_logs")
     parser.add_argument("--no-resume", action="store_true",
                         help="rerun all cases even when successful results exist in output_csv")

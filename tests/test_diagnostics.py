@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class DiagnosticsTests(unittest.TestCase):
     def test_cleanup_collects_checkpoint_even_without_run_worker(self):
-        source = (ROOT / "launch_cluster.sh").read_text()
+        source = (ROOT / "scripts" / "shell" / "launch_cluster.sh").read_text()
         cleanup = source.split("\ncleanup() {", 1)[1].split("\non_exit()", 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cleanup.sh"
@@ -39,7 +39,7 @@ cleanup() {""" + cleanup + "\ncleanup\n")
             self.assertFalse((Path(directory) / "checkpoint.json.tmp").exists())
 
     def test_stale_process_check_ignores_empty_cmdline(self):
-        source = (ROOT / 'launch_cluster.sh').read_text()
+        source = (ROOT / 'scripts' / 'shell' / 'launch_cluster.sh').read_text()
         worker = source.split("<<'REMOTE_SCRIPT'\n", 1)[1].split('\nREMOTE_SCRIPT\n', 1)[0]
         checker = worker.split("docker exec -i \"$CONTAINER\" python3 - \"$BENCH_SCRIPT\" <<'PY'\n", 1)[1].split('\nPY\n', 1)[0]
         tree = ast.parse(checker)
@@ -51,12 +51,12 @@ cleanup() {""" + cleanup + "\ncleanup\n")
         self.assertTrue(namespace['is_benchmark_process'](['python3', 'run_bench.py'], 'run_bench.py'))
 
     def test_launcher_watchdog_tracks_sleep_process_directly(self):
-        source = (ROOT / 'launch_cluster.sh').read_text()
+        source = (ROOT / 'scripts' / 'shell' / 'launch_cluster.sh').read_text()
         self.assertIn('sleep "$TIMEOUT_SEC" &\nWATCHDOG_PID=$!', source)
         self.assertNotIn('( sleep "$TIMEOUT_SEC"; exit 124 ) &', source)
 
     def test_latency_max_reduction_uses_hccl_supported_float32(self):
-        source = (ROOT / 'run_bench.py').read_text()
+        source = (ROOT / 'scripts' / 'python' / 'run_bench.py').read_text()
         tree = ast.parse(source)
         function = next(node for node in tree.body
                         if isinstance(node, ast.FunctionDef) and node.name == 'max_latency')
@@ -88,7 +88,7 @@ cleanup() {""" + cleanup + "\ncleanup\n")
 
         namespace = {'torch': FakeTorch, 'dist': FakeDist}
         exec(compile(ast.Module(body=[function], type_ignores=[]),
-                     str(ROOT / 'run_bench.py'), 'exec'), namespace)
+                     str(ROOT / 'scripts' / 'python' / 'run_bench.py'), 'exec'), namespace)
         result = namespace['max_latency'](1.25, object())
         self.assertEqual(result, 1.25)
         self.assertIs(FakeTorch.observed_dtype, FakeTorch.float32)
@@ -119,7 +119,7 @@ npu = NPU()
             env = dict(os.environ, PYTHONPATH=str(temp), RANK='3', LOCAL_RANK='1',
                        HCCL_BENCH_DIAG_DIR=str(temp / 'diagnostics'),
                        HCCL_BENCH_STACK_INTERVAL='0', PYTHONDONTWRITEBYTECODE='1')
-            result = subprocess.run(['python3', str(ROOT / 'run_bench.py'),
+            result = subprocess.run(['python3', str(ROOT / 'scripts' / 'python' / 'run_bench.py'),
                                      '--size-bytes', '16', '--group-size', '2'],
                                     env=env, capture_output=True, text=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
@@ -134,7 +134,7 @@ npu = NPU()
     def test_worker_failure_preserves_exit_and_shell_location(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
-            source = (ROOT / 'launch_cluster.sh').read_text()
+            source = (ROOT / 'scripts' / 'shell' / 'launch_cluster.sh').read_text()
             worker = source.split("<<'REMOTE_SCRIPT'\n", 1)[1].split('\nREMOTE_SCRIPT\n', 1)[0]
             (temp / 'worker.sh').write_text(worker)
             docker = temp / 'docker'

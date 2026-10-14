@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("run_matrix", ROOT / "run_matrix.py")
+SPEC = importlib.util.spec_from_file_location("run_matrix", ROOT / "scripts" / "python" / "run_matrix.py")
 matrix = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(matrix)
 
@@ -103,7 +103,7 @@ Path(os.environ['READY_FILE']).touch()
 PYTHON
 while true; do sleep 0.1 & wait $!; done
 """)
-            argv = [str(ROOT / "run_matrix.py"), "--config", str(path), "--launcher", str(launcher),
+            argv = [str(ROOT / "scripts" / "python" / "run_matrix.py"), "--config", str(path), "--launcher", str(launcher),
                     "--log-dir", str(Path(directory) / "logs")]
             env = dict(os.environ, NPROC_PER_NODE="2", HCCL_NODES="", READY_FILE=str(ready))
             process = subprocess.Popen([sys.executable, *argv], env=env,
@@ -191,7 +191,7 @@ while true; do sleep 0.1 & wait $!; done
         self.assertTrue(case["case_id"].startswith("g8_n2_p4_group8_"), case["case_id"])
 
     def test_benchmark_uses_world_without_creating_subgroups(self):
-        tree = ast.parse((ROOT / "run_bench.py").read_text())
+        tree = ast.parse((ROOT / "scripts" / "python" / "run_bench.py").read_text())
         function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                         and n.name == "select_world_group")
         dist = mock.Mock()

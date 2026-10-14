@@ -1,6 +1,6 @@
 # HCCL communication latency matrix
 
-`run_matrix.py` runs the Cartesian product in a JSON file. Cases with the same
+`scripts/python/run_matrix.py` runs the Cartesian product in a JSON file. Cases with the same
 group size, node count, ranks per node, execution mode, expansion mode, and dtype share one distributed
 launch and HCCL communicator; every configured operator and byte size runs in
 order. Each completed case is checkpointed; after the launcher exits, its results
@@ -16,12 +16,12 @@ rejections appear as failed cases in the CSV.
 
 ## Run
 
-Edit `matrix_config.example.json`, then run from a machine with the cluster SSH
-and Docker access configured for `launch_cluster.sh`:
+Edit `config/matrix_config.example.json`, then run from a machine with the cluster SSH
+and Docker access configured for `scripts/shell/launch_cluster.sh`:
 
 ```bash
-python3 run_matrix.py --config matrix_config.example.json --dry-run --nodes 10.0.0.2,10.0.0.3
-DOCKER_SCRIPT=/shared/docker-gen.sh BENCH_SCRIPT=/workspace/run_bench.py IMAGE_NAME=my-hccl-image python3 run_matrix.py --config matrix_config.example.json --nodes 10.0.0.2,10.0.0.3
+python3 scripts/python/run_matrix.py --config config/matrix_config.example.json --dry-run --nodes 10.0.0.2,10.0.0.3
+DOCKER_SCRIPT=/shared/docker-gen.sh BENCH_SCRIPT=/workspace/run_bench.py IMAGE_NAME=my-hccl-image python3 scripts/python/run_matrix.py --config config/matrix_config.example.json --nodes 10.0.0.2,10.0.0.3
 ```
 
 ### 失败后恢复
@@ -53,8 +53,8 @@ listed hosts and capacity 8, launches use `(2,4)` and `(1,8)`. Omitting
 `--nodes` keeps the legacy single-host mode on `MASTER_ADDR` (default
 `141.61.94.99`). The standalone launcher still treats `NPROC_PER_NODE` as the
 actual ranks per node.
-Set `DOCKER_SCRIPT` to the `docker-gen.sh` path visible on each worker host, and
-`BENCH_SCRIPT` to the `run_bench.py` path visible inside the container. Both are
+Set `DOCKER_SCRIPT` to the `scripts/shell/docker-gen.sh` path visible on each worker host, and
+`BENCH_SCRIPT` to the `scripts/python/run_bench.py` path visible inside the container. Both are
 required and have no defaults. The benchmark script must also be visible at the
 same path on every worker host if the container uses a host mount.
 
@@ -81,7 +81,7 @@ HCCL does not expose a portable runtime query for it.
 检查指定节点上的 NPU 使用和进程：
 
 ```bash
-python3 query_npu_usage.py --nodes 141.61.94.111,141.61.94.112
+python3 scripts/python/query_npu_usage.py --nodes 141.61.94.111,141.61.94.112
 ```
 
 脚本通过 SSH 在每个节点执行 `npu-smi info`，输出设备利用率、显存和占用进程表；
@@ -91,7 +91,7 @@ SSH 用户默认为 `SSH_USER` 环境变量或 `root`，可用 `--ssh-user` 覆�
 `eager` uses direct PyTorch distributed calls. `ascend_ir` requires TorchAir's
 HCCL patch and full graph compilation. `aclgraph` requires the NPU graph APIs
 exposed by the installed torch_npu. Unsupported or failed graph runs are
-recorded; they are never silently measured as eager. `run_matrix.py` records
+recorded; they are never silently measured as eager. `scripts/python/run_matrix.py` records
 one CSV row per case and topology, with latency statistics in milliseconds
 and a status/reason for every skipped or failed case.
 

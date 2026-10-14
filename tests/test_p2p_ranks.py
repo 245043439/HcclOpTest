@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-SPEC = importlib.util.spec_from_file_location("run_matrix", Path(__file__).resolve().parents[1] / "run_matrix.py")
+SPEC = importlib.util.spec_from_file_location("run_matrix", Path(__file__).resolve().parents[1] / "scripts" / "python" / "run_matrix.py")
 matrix = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(matrix)
 
