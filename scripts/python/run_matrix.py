@@ -21,6 +21,7 @@ EXEC_MODES = {"eager", "ascend_ir", "aclgraph"}
 EXPANSIONS = {"DEFAULT", "AI_CPU", "CCU_SCHED", "CCU_MS", "AIV"}
 DTYPE_SIZES = {"float16": 2, "float32": 4, "bfloat16": 2,
                "int8": 1, "uint8": 1, "int16": 2, "int32": 4, "int64": 8}
+MAX_CASES_JSON_BYTES = 64 * 1024
 FIELDS = [
     "case_id", "operator", "size_bytes", "dtype", "group_size", "rank_start", "rank_end",
     "execution_mode", "requested_expansion_mode", "actual_expansion_mode", "input_bytes",
@@ -142,6 +143,32 @@ def group_cases(cases):
                case["node_count"], case["nproc_per_node"])
         groups.setdefault(key, []).append(case)
     return list(groups.items())
+
+
+def split_cases_by_env_size(keyed_batches, max_bytes=MAX_CASES_JSON_BYTES):
+    """Split launches so MATRIX_CASES_JSON stays safely below OS env limits."""
+    batches = []
+    for key, cases in keyed_batches:
+        chunk = []
+        chunk_bytes = 2  # JSON list brackets
+        for case in cases:
+            encoded = json.dumps({"case_id": case["case_id"],
+                                  "operator": case["operator"],
+                                  "size_bytes": case["size_bytes"]},
+                                 separators=(",", ":")).encode("utf-8")
+            entry_bytes = len(encoded) + (1 if chunk else 0)
+            if chunk and chunk_bytes + entry_bytes > max_bytes:
+                batches.append((key, chunk))
+                chunk = []
+                chunk_bytes = 2
+                entry_bytes = len(encoded)
+            if chunk_bytes + entry_bytes > max_bytes:
+                raise ValueError(f"case {case['case_id']} exceeds MATRIX_CASES_JSON size limit")
+            chunk.append(case)
+            chunk_bytes += entry_bytes
+        if chunk:
+            batches.append((key, chunk))
+    return batches
 
 
 def validate_case(case, world_size):
@@ -421,7 +448,8 @@ def main():
         completed = set()
     print(f"Resume: {len(completed)} successful cases skipped; "
           f"{len(cases) - len(completed)} combinations remaining", flush=True)
-    batches = group_cases([case for case in cases if case["case_id"] not in completed])
+    batches = split_cases_by_env_size(
+        group_cases([case for case in cases if case["case_id"] not in completed]))
     if args.dry_run:
         valid = 0
         for key, batch in batches:

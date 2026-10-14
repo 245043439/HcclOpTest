@@ -199,6 +199,20 @@ while true; do sleep 0.1 & wait $!; done
                         ValueError, "size_scale_factors"):
                     matrix.load_config(path)
 
+    def test_large_case_lists_are_split_under_environment_limit(self):
+        cases = [{"case_id": f"case_{index:04d}", "operator": "allreduce",
+                  "size_bytes": index + 1} for index in range(20)]
+        batches = matrix.split_cases_by_env_size([("key", cases)], max_bytes=500)
+        self.assertGreater(len(batches), 1)
+        self.assertEqual([case["case_id"] for _, batch in batches for case in batch],
+                         [case["case_id"] for case in cases])
+        for _, batch in batches:
+            payload = json.dumps([{"case_id": case["case_id"],
+                                   "operator": case["operator"],
+                                   "size_bytes": case["size_bytes"]} for case in batch],
+                                 separators=(",", ":"))
+            self.assertLessEqual(len(payload.encode("utf-8")), 500)
+
     def test_dtype_is_required_and_taken_from_json(self):
         with tempfile.TemporaryDirectory() as directory:
             config = json.loads(self.config(directory).read_text())
