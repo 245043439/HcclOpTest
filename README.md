@@ -62,12 +62,12 @@ The supported operations are allreduce, alltoall, reducescatter, allgather,
 broadcast, ring batch_send_recv, and unidirectional send_recv from the first to
 last rank of each group. Group sizes must be powers of two and equal the world size of each launch.
 
-所有算子统一使用 CSV 的 `rank_list` 记录通信域中的 global_rank，保存为 JSON 数组。
+所有算子统一使用 CSV 的 `rank_list` 记录参与该算子数据通信的 global_rank，保存为 JSON 数组。
 编号规则为 `节点在 --nodes 中的序号 × rank_stride + 本地卡号`，两者都从 0 开始。
 JSON 配置的 `rank_stride` 默认是 8，应设置为每节点实际卡数，不能小于每节点启动的进程数。
-例如 `n2_p1` 为 `[0, 8]`，`n1_p2` 为 `[0, 1]`，`n2_p2` 为 `[0, 1, 8, 9]`。
+例如 `n2_p1` 为 `[0, 8]`，`n1_p2` 为 `[0, 1]`，`n2_p2` 的完整通信组为 `[0, 1, 8, 9]`。
 `--dry-run` 也会显示该列表；实际通信仍使用 torchrun 的连续 rank 编号。
-`send_recv` 从列表首项发送到末项，`batch_send_recv` 按列表顺序组成环。
+`send_recv` 的 `rank_list` 只列发送端和接收端（`n2_p2` 为 `[0, 9]`）；其他 rank 仍参与分布式组和同步。`batch_send_recv` 按完整列表组成环。
 旧的 rank_start/rank_end、source_rank/target_rank 列不再输出。
 旧 CSV 仍可恢复；追加结果时会原子转换为新表头，依据历史 case ID 中的拓扑和
 rank 范围生成 rank_list。历史 rank_stride 缺失时按 8 处理，无法识别的拓扑记录为 `[]`。

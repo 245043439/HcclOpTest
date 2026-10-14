@@ -19,7 +19,7 @@ class EndpointTests(unittest.TestCase):
 
     def test_cross_node_and_local_pairs(self):
         cfg = dict(warmup=0, repeat=1, rank_stride=8)
-        for nodes, procs, target in [(2, 1, [0, 8]), (1, 2, [0, 1]), (2, 2, [0, 1, 8, 9])]:
+        for nodes, procs, target in [(2, 1, [0, 8]), (1, 2, [0, 1]), (2, 2, [0, 9])]:
             with self.subTest(nodes=nodes, procs=procs):
                 case = self.case(nodes, procs)
                 row = matrix.result_row(case, cfg, dict(status="success", group_start=0,
@@ -31,7 +31,8 @@ class EndpointTests(unittest.TestCase):
 
     def test_ring_edges(self):
         for op in matrix.OPS:
-            self.assertEqual(matrix.global_ranks(self.case(2, 2, op), {}), [0, 1, 8, 9])
+            expected = [0, 9] if op == "send_recv" else [0, 1, 8, 9]
+            self.assertEqual(matrix.global_ranks(self.case(2, 2, op), {}), expected)
         with self.assertRaises(ValueError):
             matrix.global_ranks(self.case(1, 4), {"rank_stride": 2})
 

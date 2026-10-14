@@ -161,7 +161,7 @@ def base_row(case, cfg, status, reason="", log_path="", start="", end=""):
 
 
 def global_ranks(case, cfg, start="", end=""):
-    """Map the communicator's dense ranks to global physical slot numbers."""
+    """Map operator participants to global physical slot numbers."""
     procs = case["nproc_per_node"]
     if not procs or not case["total_ranks"]:
         return []
@@ -170,7 +170,10 @@ def global_ranks(case, cfg, start="", end=""):
         raise ValueError("rank_stride must be at least the number of processes per node")
     first = 0 if start == "" else int(start)
     last = case["total_ranks"] - 1 if end == "" else int(end)
-    return [(r // procs) * stride + r % procs for r in range(first, last + 1)]
+    ranks = [(r // procs) * stride + r % procs for r in range(first, last + 1)]
+    if case.get("operator") == "send_recv" and ranks:
+        return [ranks[0], ranks[-1]]
+    return ranks
 
 
 def legacy_rank_list(row):
@@ -180,7 +183,8 @@ def legacy_rank_list(row):
         return []
     try:
         nodes, procs = map(int, match.groups())
-        return global_ranks({"nproc_per_node": procs, "total_ranks": nodes * procs},
+        return global_ranks({"operator": row.get("operator"),
+                             "nproc_per_node": procs, "total_ranks": nodes * procs},
                             {"rank_stride": int(row.get("rank_stride") or 8)},
                             row["rank_start"], row["rank_end"])
     except (ValueError, TypeError):
@@ -246,7 +250,12 @@ def successful_cases(path, cases, cfg):
                 continue
             if "rank_list" in row:
                 try:
-                    ranks_match = json.loads(row["rank_list"]) == global_ranks(case, cfg)
+                    recorded_ranks = json.loads(row["rank_list"])
+                    ranks_match = recorded_ranks == global_ranks(case, cfg)
+                    if case["operator"] == "send_recv" and not ranks_match:
+                        # Older result files recorded the full communicator for send_recv.
+                        ranks_match = recorded_ranks == global_ranks(
+                            dict(case, operator=""), cfg)
                 except (TypeError, ValueError):
                     ranks_match = False
             else:
