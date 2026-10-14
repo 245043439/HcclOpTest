@@ -330,6 +330,11 @@ def main():
               f"planned_launches={sum(any(not validate_case(c, c['total_ranks']) for c in b) for _, b in batches)} "
               f"available_nodes={available_nodes} max_procs_per_node={nproc}")
         return 0
+    missing_scripts = [name for name in ("DOCKER_SCRIPT", "BENCH_SCRIPT")
+                       if not os.environ.get(name)]
+    if missing_scripts:
+        raise ValueError("set required script path environment variables: "
+                         + ", ".join(missing_scripts))
     log_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     stopped = False
@@ -374,7 +379,8 @@ def main():
                       "size_bytes": c["size_bytes"]} for c in pending], separators=(",", ":")),
                 "CASE_RESULT_FILE": str(host_result),
                 "HCCL_NODES_ONLY": "1" if remote_nodes_only else "0",
-                "BENCH_SCRIPT": env.get("BENCH_SCRIPT", str(Path(__file__).resolve().with_name("run_bench.py")))})
+                "BENCH_SCRIPT": env["BENCH_SCRIPT"],
+                "DOCKER_SCRIPT": env["DOCKER_SCRIPT"]})
             label = f"{batch_id}/attempt_{attempt}"
             print(f"[{label}] launching {len(pending)} cases; first={pending[0]['case_id']}", flush=True)
             try:

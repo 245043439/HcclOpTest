@@ -21,7 +21,7 @@ and Docker access configured for `launch_cluster.sh`:
 
 ```bash
 python3 run_matrix.py --config matrix_config.example.json --dry-run --nodes 10.0.0.2,10.0.0.3
-IMAGE_NAME=my-hccl-image python3 run_matrix.py --config matrix_config.example.json --nodes 10.0.0.2,10.0.0.3
+DOCKER_SCRIPT=/shared/docker-gen.sh BENCH_SCRIPT=/workspace/run_bench.py IMAGE_NAME=my-hccl-image python3 run_matrix.py --config matrix_config.example.json --nodes 10.0.0.2,10.0.0.3
 ```
 
 ### 失败后恢复
@@ -53,9 +53,10 @@ listed hosts and capacity 8, launches use `(2,4)` and `(1,8)`. Omitting
 `--nodes` keeps the legacy single-host mode on `MASTER_ADDR` (default
 `141.61.94.99`). The standalone launcher still treats `NPROC_PER_NODE` as the
 actual ranks per node.
-`run_matrix.py` passes this checkout's `run_bench.py` path to the launcher by
-default. The checkout must be visible at the same path on all nodes and inside
-the container; set `BENCH_SCRIPT` to the container-visible path if it differs.
+Set `DOCKER_SCRIPT` to the `docker-gen.sh` path visible on each worker host, and
+`BENCH_SCRIPT` to the `run_bench.py` path visible inside the container. Both are
+required and have no defaults. The benchmark script must also be visible at the
+same path on every worker host if the container uses a host mount.
 
 The supported operations are allreduce, alltoall, reducescatter, allgather,
 broadcast, ring batch_send_recv, and unidirectional send_recv from the first to
