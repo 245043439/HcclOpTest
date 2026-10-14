@@ -55,6 +55,13 @@ def load_config(path):
     for key in ("sizes_bytes", "group_sizes"):
         if any(not isinstance(x, int) or isinstance(x, bool) for x in cfg[key]):
             raise ValueError(f"{key} entries must be integers")
+    size_scale_factors = cfg.setdefault("size_scale_factors", [])
+    if not isinstance(size_scale_factors, list):
+        raise ValueError("size_scale_factors must be a list")
+    for factor in size_scale_factors:
+        if (not isinstance(factor, int) or isinstance(factor, bool)
+                or factor < 2 or factor & (factor - 1)):
+            raise ValueError("size_scale_factors entries must be powers of two >= 2")
     cfg.setdefault("warmup", 10)
     cfg.setdefault("repeat", 50)
     cfg.setdefault("case_timeout_sec", 900)
@@ -73,7 +80,8 @@ def load_config(path):
 
 
 def make_cases(cfg, node_count=None, nproc_per_node=None):
-    combos = itertools.product(cfg["operators"], cfg["sizes_bytes"], cfg["group_sizes"],
+    sizes = expand_sizes(cfg["sizes_bytes"], cfg.get("size_scale_factors", []))
+    combos = itertools.product(cfg["operators"], sizes, cfg["group_sizes"],
                                cfg["execution_modes"], cfg["expansion_modes"])
     cases = []
     for op, size, group, execution, expansion in combos:
@@ -92,6 +100,21 @@ def make_cases(cfg, node_count=None, nproc_per_node=None):
         data["case_id"] = f"g{ranks_label}_n{nodes_label}_p{procs_label}_group{group}_{digest}"
         cases.append(data)
     return cases
+
+
+def expand_sizes(sizes_bytes, factors):
+    """Expand base byte sizes by configured powers-of-two factors."""
+    expanded = []
+    seen = set()
+    for size in sizes_bytes:
+        candidates = [size]
+        candidates.extend(size // factor for factor in factors if size % factor == 0)
+        candidates.extend(size * factor for factor in factors)
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
+    return expanded
 
 
 def make_topology_cases(cfg, available_nodes, max_procs_per_node):

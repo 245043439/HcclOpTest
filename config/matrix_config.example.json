@@ -9,6 +9,7 @@
     "send_recv"
   ],
   "sizes_bytes": [1024, 65536, 1048576, 16777216, 67108864],
+  "size_scale_factors": [2, 4, 8, 16, 32, 64],
   "dtype": "float16",
   "group_sizes": [2, 4, 8, 16, 32, 64],
   "execution_modes": ["eager", "ascend_ir", "aclgraph"],

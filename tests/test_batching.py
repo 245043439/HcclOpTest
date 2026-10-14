@@ -174,6 +174,31 @@ while true; do sleep 0.1 & wait $!; done
                          [("allreduce", 16), ("allreduce", 32),
                           ("broadcast", 16), ("broadcast", 32)])
 
+    def test_size_scale_factors_expand_in_order_and_deduplicate(self):
+        self.assertEqual(matrix.expand_sizes([16, 32], [2, 4]),
+                         [16, 8, 4, 32, 64, 128])
+        cfg = matrix.load_config(self.config(tempfile.mkdtemp()))
+        cfg["sizes_bytes"] = [16, 32]
+        cfg["size_scale_factors"] = [2, 4]
+        cases = matrix.make_cases(cfg)
+        self.assertEqual(list(dict.fromkeys(c["size_bytes"] for c in cases)),
+                         [16, 8, 4, 32, 64, 128])
+
+    def test_size_scale_factors_default_empty_and_validate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.config(directory)
+            cfg = matrix.load_config(path)
+            self.assertEqual(cfg["size_scale_factors"], [])
+            self.assertEqual(matrix.expand_sizes([5, 16], []), [5, 16])
+            self.assertEqual(matrix.expand_sizes([5], [2]), [5, 10])
+            for factors in ([1], [3], [2.0], [True], "2"):
+                invalid = json.loads(path.read_text())
+                invalid["size_scale_factors"] = factors
+                path.write_text(json.dumps(invalid))
+                with self.subTest(factors=factors), self.assertRaisesRegex(
+                        ValueError, "size_scale_factors"):
+                    matrix.load_config(path)
+
     def test_dtype_is_required_and_taken_from_json(self):
         with tempfile.TemporaryDirectory() as directory:
             config = json.loads(self.config(directory).read_text())

@@ -13,6 +13,11 @@ Set the required tensor dtype with the JSON `dtype` field (the example uses
 `float32`, `bfloat16`, `int8`, `uint8`, `int16`, `int32`, and `int64`. HCCL
 support for a dtype can vary by operation, product and CANN version, so runtime
 rejections appear as failed cases in the CSV.
+The optional `size_scale_factors` field expands every `sizes_bytes` entry by
+each configured power-of-two factor: divisible sizes are also divided by the
+factor, and every size is multiplied by it. The original size is retained;
+non-integer byte divisions are skipped, and duplicate sizes are emitted once
+in first-seen order. Leave the field out or set it to `[]` to disable expansion.
 
 ## Run
 
