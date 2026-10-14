@@ -72,14 +72,14 @@ def summarize_processes(output):
     return "无法判断（未识别到进程表或明确的空进程提示）", []
 
 
-def print_process_summary(status, stdout):
+def print_process_summary(status, stdout, show_processes=False):
     if status != 0:
         print(f"NPU 进程状态：无法判断（查询失败，退出码 {status}）")
         return
 
     summary, processes = summarize_processes(stdout)
     print(f"NPU 进程状态：{summary}")
-    for process in processes:
+    for process in processes if show_processes else ():
         fields = (
             ("npu id", "NPU"),
             ("process id", "PID"),
@@ -102,6 +102,8 @@ def main():
                         help="SSH connection timeout in seconds")
     parser.add_argument("--timeout", type=int, default=30,
                         help="full query timeout per node in seconds")
+    parser.add_argument("--verbose", action="store_true",
+                        help="also print the full npu-smi info output")
     args = parser.parse_args()
     nodes = list(dict.fromkeys(part.strip() for part in args.nodes.split(",") if part.strip()))
     if not nodes:
@@ -115,11 +117,11 @@ def main():
             ip, args.ssh_user, args.connect_timeout, args.timeout), nodes))
     for ip, status, stdout, stderr in results:
         print(f"===== {ip} | {'OK' if status == 0 else f'FAILED ({status})'} =====")
-        if stdout:
+        if args.verbose and stdout:
             print(stdout, end="" if stdout.endswith("\n") else "\n")
         if stderr:
             print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
-        print_process_summary(status, stdout)
+        print_process_summary(status, stdout, show_processes=args.verbose)
         failed |= status != 0
     return 1 if failed else 0
 
