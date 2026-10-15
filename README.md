@@ -33,6 +33,10 @@ DOCKER_SCRIPT=/shared/docker-gen.sh BENCH_SCRIPT=/workspace/run_bench.py IMAGE_N
 
 ### 失败后恢复
 
+预检失败（退出码 69）只将当前批次的未完成用例标记为 `not_run`，继续执行后续批次，
+包括同一 group 的其他拓扑和后续 group；每个批次仍独立预检。
+清理失败（退出码 70）仍停止整个矩阵，并将剩余用例标记为 `not_run`，避免残留任务影响后续测试。
+
 重新执行相同命令即可默认恢复：运行器读取配置中的 `output_csv`，按 case ID
 （含算子、大小、dtype、执行模式、展开模式和拓扑）、warmup 和 repeat 匹配历史结果。
 只有最新匹配记录为 `success` 且包含完整 rank 范围时才跳过；失败、超时、
@@ -70,6 +74,7 @@ broadcast, ring batch_send_recv, and unidirectional send_recv from the first to
 last rank of each group. Group sizes must be powers of two and equal the world size of each launch.
 
 所有算子统一使用 CSV 的 `rank_list` 记录参与该算子数据通信的 global_rank，保存为 JSON 数组。
+`comm_layer_list` 记录通信层级，格式为 `(超节点数,节点数,每节点进程数)`；当前超节点数固定为 1，例如 `(1,2,4)`。
 编号规则为 `节点在 --nodes 中的序号 × rank_stride + 本地卡号`，两者都从 0 开始。
 JSON 配置的 `rank_stride` 默认是 8，应设置为每节点实际卡数，不能小于每节点启动的进程数。
 例如 `n2_p1` 为 `[0, 8]`，`n1_p2` 为 `[0, 1]`，`n2_p2` 的完整通信组为 `[0, 1, 8, 9]`。

@@ -21,6 +21,51 @@ SPEC.loader.exec_module(matrix)
 
 
 class BatchingTests(unittest.TestCase):
+    def test_preflight_skips_batch_but_cleanup_stops_matrix(self):
+        for failure_code in (69, 70):
+            with self.subTest(failure_code=failure_code), tempfile.TemporaryDirectory() as directory:
+                path = self.config(directory)
+                cfg = json.loads(path.read_text())
+                cfg["group_sizes"] = [8, 16]
+                path.write_text(json.dumps(cfg))
+                nodes = [f"10.0.0.{index}" for index in range(1, 9)]
+                launches = []
+
+                def launch(cmd, env, timeout, log_path, label):
+                    launches.append((int(env["GROUP_SIZE"]), len(cmd[2:])))
+                    # Every eight-node placement includes the unavailable node.
+                    if len(cmd[2:]) == 8:
+                        return failure_code
+                    batch = json.loads(env["MATRIX_CASES_JSON"])
+                    Path(env["CASE_RESULT_FILE"]).write_text(json.dumps({
+                        "complete": True, "results": [dict(
+                            case, status="success", group_start=0,
+                            group_end=int(env["GROUP_SIZE"]) - 1) for case in batch]}))
+                    return 0
+
+                argv = ["run_matrix.py", "--config", str(path), "--nodes", ",".join(nodes),
+                        "--log-dir", str(Path(directory) / "logs")]
+                with mock.patch("sys.argv", argv), mock.patch.dict(os.environ, {
+                        "NPROC_PER_NODE": "8", "DOCKER_SCRIPT": "docker-gen.sh",
+                        "BENCH_SCRIPT": "run_bench.py"}), \
+                     mock.patch.object(matrix, "run_launcher", side_effect=launch):
+                    self.assertEqual(matrix.main(), 0)
+                with Path(cfg["output_csv"]).open(newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                cases = matrix.make_topology_cases(matrix.load_config(path), 8, 8)
+                self.assertEqual(len(rows), len(cases))
+                by_id = {row["case_id"]: row for row in rows}
+                self.assertEqual(len(by_id), len(cases))
+                if failure_code == 69:
+                    self.assertEqual(launches, [(8, 8), (8, 4), (8, 2), (8, 1),
+                                                (16, 8), (16, 4), (16, 2)])
+                    for case in cases:
+                        self.assertEqual(by_id[case["case_id"]]["status"],
+                                         "not_run" if case["node_count"] == 8 else "success")
+                else:
+                    self.assertEqual(launches, [(8, 8)])
+                    self.assertTrue(all(row["status"] == "not_run" for row in rows))
+
     def test_restart_retries_unsuccessful_cases_and_preserves_logs(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.config(directory)

@@ -34,6 +34,8 @@ LEGACY_FIELDS = FIELDS[:]
 ENDPOINT_FIELDS = LEGACY_FIELDS + ["source_rank", "target_rank", "rank_stride"]
 FIELDS = [field for field in LEGACY_FIELDS if field not in {"rank_start", "rank_end"}]
 FIELDS.insert(5, "rank_list")
+PREVIOUS_FIELDS = FIELDS[:]
+FIELDS.insert(6, "comm_layer_list")
 
 
 def load_config(path):
@@ -205,6 +207,9 @@ def base_row(case, cfg, status, reason="", log_path="", start="", end=""):
             "size_bytes": case["size_bytes"], "dtype": case["dtype"],
             "group_size": case["group_size"],
             "rank_list": json.dumps(global_ranks(case, cfg, start, end)),
+            "comm_layer_list": (f"(1,{case['node_count']},{case['nproc_per_node']})"
+                                if case.get("node_count") is not None
+                                and case.get("nproc_per_node") is not None else ""),
             "execution_mode": case["execution_mode"],
             "requested_expansion_mode": case["expansion_mode"],
             "actual_expansion_mode": "unknown", "input_bytes": "", "output_bytes": "",
@@ -254,7 +259,7 @@ def upgrade_csv(path):
             reader = csv.DictReader(source)
             if reader.fieldnames == FIELDS:
                 return
-            if reader.fieldnames not in (LEGACY_FIELDS, ENDPOINT_FIELDS):
+            if reader.fieldnames not in (PREVIOUS_FIELDS, LEGACY_FIELDS, ENDPOINT_FIELDS):
                 raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
             with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8",
                                              dir=path.parent, delete=False) as target:
@@ -263,6 +268,9 @@ def upgrade_csv(path):
                 writer.writeheader()
                 for row in reader:
                     row["rank_list"] = json.dumps(legacy_rank_list(row))
+                    topology = re.search(r"_n([0-9]+)_p([0-9]+)_", row.get("case_id", ""))
+                    row["comm_layer_list"] = (f"(1,{topology.group(1)},{topology.group(2)})"
+                                               if topology else "")
                     writer.writerow(row)
                 target.flush()
                 os.fsync(target.fileno())
@@ -295,7 +303,7 @@ def successful_cases(path, cases, cfg):
     completed = set()
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
-        if reader.fieldnames not in (FIELDS, LEGACY_FIELDS, ENDPOINT_FIELDS):
+        if reader.fieldnames not in (FIELDS, PREVIOUS_FIELDS, LEGACY_FIELDS, ENDPOINT_FIELDS):
             raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
         for row in reader:
             case_id = row.get("case_id")
@@ -546,11 +554,14 @@ def main():
                 if return_code == 0 and payload and payload.get("complete"):
                     break
                 if return_code in (69, 70):
+                    stopped = return_code == 70
+                    reason = ("cluster cleanup failed; stopped matrix" if stopped else
+                              "cluster preflight failed; skipped batch")
                     for case in pending:
                         if case["case_id"] not in completed:
                             append_rows(output_csv, [base_row(case, cfg, "not_run",
-                                "cluster preflight or cleanup failed; stopped matrix", str(run_dir))])
-                    stopped = True
+                                reason, str(run_dir))])
+                    print(f"[{label}] {reason}", flush=True)
                     break
                 current = payload.get("current_case_id") if payload else None
                 failed = next((case for case in pending if case["case_id"] == current
@@ -582,7 +593,7 @@ def main():
         if stopped:
             for _, remaining_batch in batches[batch_index:]:
                 for case in remaining_batch:
-                    append_rows(output_csv, [base_row(case, cfg, "not_run", "cluster preflight or cleanup failed; stopped matrix")])
+                    append_rows(output_csv, [base_row(case, cfg, "not_run", "cluster cleanup failed; stopped matrix")])
             break
     print(f"CSV: {output_csv} ({len(cases)} combinations, {time.time()-started:.1f}s)")
     return 0
