@@ -196,9 +196,6 @@ def validate_case(case, world_size):
         elems = size // elem_size
         if elems % group:
             return f"element count {elems} must be divisible by group_size {group}"
-    # Current Atlas 350 documentation identifies these expansion values as unsupported.
-    if case["expansion_mode"] in {"AIV", "CCU_MS"}:
-        return f"{case['expansion_mode']} is documented as unsupported on Atlas 350"
     return ""
 
 

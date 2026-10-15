@@ -85,10 +85,8 @@ JSON 配置的 `rank_stride` 默认是 8，应设置为每节点实际卡数，�
 rank 范围生成 rank_list。历史 rank_stride 缺失时按 8 处理，无法识别的拓扑记录为 `[]`。
 节点顺序改变时，global_rank 对应的主机也会改变。
 
-Groups without a placement within the available capacity are skipped. Invalid combinations are recorded as skipped. On Atlas 350, AIV and
-CCU_MS are recorded as skipped according to the current HCCL documentation;
-actual expansion selection for other settings is reported as `unknown` because
-HCCL does not expose a portable runtime query for it.
+Groups without a placement within the available capacity are skipped. Invalid combinations are recorded as skipped.
+Expansion modes, including AIV and CCU_MS, are passed to HCCL as requested; actual expansion selection is reported as `unknown` because HCCL does not expose a portable runtime query for it.
 
 检查指定节点上的 NPU 使用和进程：
 
