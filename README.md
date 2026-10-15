@@ -197,3 +197,63 @@ Shell 命令失败会记录节点、阶段、退出码、命令和调用位置�
 产生的错误保留原始错误信息和退出记录。用例目录的 `worker.sh` 保存实际
 执行的 worker 脚本，可按错误行号定位。诊断文件收集失败时查看
 `collect_<节点编号>.log`。运行器自身的用例异常保存在 `matrix.traceback.log`。
+
+## DeepEP Dispatch / Combine BF16 性能测试
+
+`scripts/python/run_dispatch_combine_bench.py` 是独立的 `torchrun` 脚本。
+目标服务器需安装匹配的 CANN、PyTorch、torch_npu 和
+[sgl-kernel-npu 的 DeepEP](https://github.com/sgl-project/sgl-kernel-npu/blob/main/tests/python/deepep/test_low_latency.py)
+（能够 `from deep_ep import Buffer`）。不需要安装上游 tests 中的 utils。
+支持 `--low-latency-strategy default`（默认 DeepEP 扩展）和 `ops`（torch_npu 算子路径）；
+具体硬件、shape 和软件版本是否支持由目标环境决定，失败不会切换实现。
+
+单机 8 卡示例：
+
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/python/run_dispatch_combine_bench.py \
+  --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --warmup 50 --repeat 50 --check --output-csv dispatch_combine_results.csv
+```
+
+两机各 8 卡时，在每台机器运行以下命令，分别设置 `NODE_RANK=0` 和 `NODE_RANK=1`，
+`MASTER_IP` 设置为第一台机器可访问的地址；脚本和依赖需在每台机器可用：
+
+```bash
+torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_IP" --master-port=29500 \
+  scripts/python/run_dispatch_combine_bench.py \
+  --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256 \
+  --low-latency-strategy ops --warmup 50 --repeat 50 --check \
+  --output-csv dispatch_combine_ops_results.csv
+```
+
+所有 rank 必须使用相同参数，每节点进程数一致，总进程数至少为 2，专家数必须能被总进程数整除。
+`--seed` 默认 1，输入使用 seed + rank；`--rank-stride` 默认 8，不能小于每节点进程数。
+本脚本只测试 BF16、固定 token 数和标准 EP；不启用量化、共享专家、路由丢弃、
+all-to-all 特殊模式或专家 GEMM。若设置 `DEEP_USE_MODE`，必须与 strategy 一致；
+`DEEP_NORMAL_MODE_USE_INT8_QUANT`、`MOE_SHARED_EXPERT_RANK_NUM` 和
+`MOE_ENABLE_TOPK_NEG_ONE` 须未设置或为 `0`。
+`--check` 在计时外验证 combine 结果有限，并与输入乘 top-k 权重之和比较
+（`rtol=0.02, atol=0.02`）。
+
+每次运行分别输出 `dispatch`、`combine` 和 `dispatch_combine` 三行。
+计时使用 `time.perf_counter()`；开始前执行 barrier 和 NPU 同步，结束前等待 NPU 完成，
+因此包括 Python 调用和结束同步开销，不是纯设备 kernel 时间，也不使用 profiler。
+Dispatch 单测在计时外执行配对 combine；combine 单测在计时外重新 dispatch，使用本次 handle。
+串联测试直接将 dispatch 接收张量交给 combine。三组测量各自预热，独立采样，串联耗时不要求等于分项之和。
+每个测量样本取所有 rank 最大耗时，统计通信在计时外。
+
+CSV 表头与矩阵结果完全一致，时间为毫秒，包含 mean/min/max/p50/p95；
+拓扑继续使用 `rank_list` 和 `comm_layer_list`。token、hidden、top-k、expert、strategy、seed、
+check 和 rank stride 写入 `case_id`。`size_bytes` 是每 rank 原始 BF16 输入大小。
+`input_bytes/output_bytes` 仅记录数据张量大小，不包含路由、权重和 handle；dispatch 输出及
+combine 输入使用各 rank 接收张量实际分配字节数的最大值（含 padding），不是网络流量。
+串联项目的输入、输出均为原始 token 张量大小。未获取到的软件版本写 `unknown`；
+`cann_version` 读取 `CANN_VERSION` 环境变量。
+
+仅 rank 0 向其所在机器的 `--output-csv` 写入结果，默认文件为 `dispatch_combine_results.csv`。
+每个项目完成即追加并刷盘，不自动恢复或跳过历史结果；已有表头不一致会报错，
+失败非零退出且保留已经写入的项目。建议使用独立 CSV，不与其他运行并发写同一文件；
+该脚本不接入 `run_matrix.py` 的调度及 checkpoint 恢复流程。
+CPU 测试只验证参数、CSV 和计时控制逻辑；实际性能和正确性需在目标服务器验证，
+并记录拓扑、strategy、软件版本、warmup 和 repeat。
