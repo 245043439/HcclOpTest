@@ -18,8 +18,10 @@ each configured power-of-two factor: divisible sizes are also divided by the
 factor, and every size is multiplied by it. The original size is retained;
 non-integer byte divisions are skipped, and duplicate sizes are emitted once
 in first-seen order. Sizes above 8 GiB are omitted. The 8 GiB limit is also
-checked per case; for `allgather`, it applies to the output size after scaling
-by `group_size`. Leave the field out or set it to `[]` to disable expansion.
+checked per case against `size_bytes`, which is the per-rank communication
+payload convention used by the benchmark and result database. For `allgather`,
+`size_bytes` is the total output size; its local input is `size_bytes / group_size`.
+Leave the field out or set it to `[]` to disable expansion.
 
 ## Run
 
@@ -73,8 +75,29 @@ The supported operations are allreduce, alltoall, reducescatter, allgather,
 broadcast, ring batch_send_recv, and unidirectional send_recv from the first to
 last rank of each group. Group sizes must be powers of two and equal the world size of each launch.
 
+### `sizes_bytes` 与算子输入输出
+
+配置中的 `sizes_bytes`（运行时对应 `size_bytes`，即常说的 `data_size`）统一按
+**每个 rank 的张量大小**理解，单位为字节；元素数为 `size_bytes / dtype` 的单元素字节数。
+以下 input/output 均指每个 rank 的本地张量，不是通信组的总量。`p` 表示通信组大小。
+
+| 算子 | 每个 rank 的输入 | 每个 rank 的输出 | 通信含义 |
+| --- | --- | --- | --- |
+| `allreduce` | `size_bytes` | `size_bytes` | 每个 rank 对同尺寸输入做规约，结果仍为同尺寸。 |
+| `alltoall` | `size_bytes` | `size_bytes` | 输入均分为 `p` 份，每份 `size_bytes / p`，分别发往组内各 rank；输出按来源 rank 收齐 `p` 份。 |
+| `reducescatter` | `size_bytes` | `size_bytes / p` | 输入按 rank 分块规约，每个 rank 得到规约结果的一块。 |
+| `allgather` | `size_bytes / p` | `size_bytes` | `size_bytes` 表示每个 rank 的总输出大小；每个 rank 输入一块，收集所有 rank 的块。 |
+| `broadcast` | `size_bytes` | `size_bytes` | 组首 rank 广播同尺寸张量，其他 rank 接收并覆盖本地张量。 |
+| `batch_send_recv` | `size_bytes` | `size_bytes` | 每个 rank 向环中的下一个 rank 发送一份，并从上一个 rank 接收一份。 |
+| `send_recv` | `size_bytes` | `size_bytes` | 组首 rank 向组末 rank 发送一份；只有这两个端点实际发送/接收，中间 rank 只参加同步。 |
+
+例如 `dtype=float16`、`size_bytes=1024`、`p=4` 时，`alltoall` 每个 rank
+输入和输出各为 1024 字节，每对 rank 之间传输 256 字节；`allgather` 每个
+rank 输入 256 字节、输出 1024 字节。`alltoall`、`reducescatter` 和
+`allgather` 的切分要求可被 `p` 整除，不满足时该用例会报错。输入张量以全 1
+初始化，因此此基准测量通信性能，不校验 rank 来源或计算结果。
+
 所有算子统一使用 CSV 的 `rank_list` 记录参与该算子数据通信的 global_rank，保存为 JSON 数组。
-`comm_layer_list` 记录通信层级，格式为 `(超节点数,节点数,每节点进程数)`；当前超节点数固定为 1，例如 `(1,2,4)`。
 编号规则为 `节点在 --nodes 中的序号 × rank_stride + 本地卡号`，两者都从 0 开始。
 JSON 配置的 `rank_stride` 默认是 8，应设置为每节点实际卡数，不能小于每节点启动的进程数。
 例如 `n2_p1` 为 `[0, 8]`，`n1_p2` 为 `[0, 1]`，`n2_p2` 的完整通信组为 `[0, 1, 8, 9]`。
@@ -111,7 +134,7 @@ the target A5/CANN stack before expanding sizes and group counts; this local
 environment does not include NPU dependencies, so real measurements must be
 collected on the target cluster.
 
-## AllReduce：端到端计时与 msprof 通信耗时对比
+## AllReduce eager 最小用例
 
 `scripts/python/compare_allreduce.py` 是独立的 eager 最小用例，不改变矩阵测试。
 在目标服务器准备好 PyTorch、torch_npu、CANN 和 `msprof` 后，从仓库根目录运行：
@@ -125,13 +148,9 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 \
 torchrun --standalone --nnodes=1 --nproc-per-node=2 \
   scripts/python/compare_allreduce.py run --msprof --output ./allreduce_profiled
 
-# 可在不安装 torch/NPU 依赖的机器上离线分析。
-python3 scripts/python/compare_allreduce.py analyze \
-  --baseline ./allreduce_baseline --profiled ./allreduce_profiled \
-  --output ./allreduce_comparison
 ```
 
-两次运行必须使用相同的卡、通信拓扑、软件、环境变量和用例参数，依次执行，避免互相干扰。
+基线和 profiling 是两次独立采集；本脚本只负责运行并保存各 rank 的原始结果，不提供两次结果的离线对比。
 支持 `--size-bytes`、`--dtype {float16,float32,bfloat16}`、`--warmup` 和 `--repeat`。
 可分别测试 1024、1048576、67108864 字节；每个大小的基线和 profiling 参数须一致，
 并使用独立输出目录。所有输出目录应为新路径，重跑时不要混入历史文件。
@@ -149,25 +168,9 @@ python3 scripts/python/compare_allreduce.py analyze \
 若未自动生成 `op_summary*.csv`，对每个 rank 的 `PROF_*` 目录执行
 `msprof --export=on --output=<PROF目录> --type=text`，确保目录内只保留一套导出结果。
 
-分析器读取 `op_summary*.csv`，要求 `Op Type` 为 AllReduce（也接受 `hcom_all_reduce`），
-`Task Type` 为 `COMMUNICATION`，`Stream ID` 和 `Task ID` 均为 `N/A`，
-以识别完整通信记录并排除内部任务和 barrier。按 `Task Start Time` 排序后剔除预热；
-`Task Duration` 支持 us/ms/ns 并统一换算为微秒。每个 rank 必须恰好有 `warmup + repeat`
-条完整记录，默认剔除前 10 条后留下 50 条。缺失、重复、格式不支持或参数不一致均报错，
-不会用内部 kernel 时长求和替代；若目标版本导出格式不同，需根据真实导出样本调整解析。
-
-分析输出：
-
-- `iterations.csv`：每轮跨 rank 最大值及其来源 rank，包含基线端到端、profiling
-  端到端、完整通信耗时，以及差值和比例。
-- `rank_pairs.csv`：每个 rank、每轮的配对耗时、通信事件名称和源文件，可核对最大值来自不同 rank 的情况。
-- `summary.json` 和终端表格：mean、min、max、p50、p95，分位数算法与原脚本一致。
-  `ratios_of_means_pct` 是均值之比；其他百分比统计是逐轮比例的分布。
-
-端到端差值比例为 `(profiling端到端 / 通信耗时 - 1) × 100%`；
-采集扰动比例为 `(profiling端到端 / 基线端到端 - 1) × 100%`。
-两次独立运行的轮次仅按序号对齐。差值可能受主机下发、同步等待、rank 偏斜和采集扰动影响，
-不能直接称为纯 Python 开销，也不保证始终为正。正式比较建议重复成对运行，观察波动。
+每个 rank 的端到端样本和版本、硬件元数据保存在 `rank_<rank>.json`；msprof 原始产物位于
+`profiler/rank_<rank>/`。需要查看通信耗时或对照不同采集时，请直接使用这些原始文件和 msprof
+导出结果自行分析。脚本不负责解析 `op_summary*.csv`，也不比较基线与 profiling 两次运行。
 
 CPU 回归测试：`python3 -m unittest discover -s tests -p 'test_compare_allreduce.py' -v`。
 双卡实测在目标服务器完成；CPU 测试不代表已验证目标环境的 profiler 兼容性。

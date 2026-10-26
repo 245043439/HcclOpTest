@@ -35,7 +35,8 @@ ENDPOINT_FIELDS = LEGACY_FIELDS + ["source_rank", "target_rank", "rank_stride"]
 FIELDS = [field for field in LEGACY_FIELDS if field not in {"rank_start", "rank_end"}]
 FIELDS.insert(5, "rank_list")
 PREVIOUS_FIELDS = FIELDS[:]
-FIELDS.insert(6, "comm_layer_list")
+COMM_LAYER_FIELDS = FIELDS[:]
+COMM_LAYER_FIELDS.insert(6, "comm_layer_list")
 
 
 def load_config(path):
@@ -178,10 +179,11 @@ def validate_case(case, world_size):
     size, group = case["size_bytes"], case["group_size"]
     if size <= 0:
         return "size_bytes must be positive"
-    output_size = size * group if case["operator"] == "allgather" else size
-    if output_size > MAX_SIZE_BYTES:
-        measured = "allgather output size" if case["operator"] == "allgather" else "size_bytes"
-        return f"{measured} exceeds 8 GiB limit"
+    # size_bytes is the per-rank operation payload convention used by the
+    # benchmark and database. For allgather it denotes the total output size;
+    # multiplying it by group size would incorrectly treat it as input size.
+    if size > MAX_SIZE_BYTES:
+        return "size_bytes exceeds 8 GiB limit"
     dtype = case["dtype"]
     elem_size = DTYPE_SIZES[dtype]
     if size % elem_size:
@@ -204,9 +206,6 @@ def base_row(case, cfg, status, reason="", log_path="", start="", end=""):
             "size_bytes": case["size_bytes"], "dtype": case["dtype"],
             "group_size": case["group_size"],
             "rank_list": json.dumps(global_ranks(case, cfg, start, end)),
-            "comm_layer_list": (f"(1,{case['node_count']},{case['nproc_per_node']})"
-                                if case.get("node_count") is not None
-                                and case.get("nproc_per_node") is not None else ""),
             "execution_mode": case["execution_mode"],
             "requested_expansion_mode": case["expansion_mode"],
             "actual_expansion_mode": "unknown", "input_bytes": "", "output_bytes": "",
@@ -256,7 +255,8 @@ def upgrade_csv(path):
             reader = csv.DictReader(source)
             if reader.fieldnames == FIELDS:
                 return
-            if reader.fieldnames not in (PREVIOUS_FIELDS, LEGACY_FIELDS, ENDPOINT_FIELDS):
+            if reader.fieldnames not in (COMM_LAYER_FIELDS, PREVIOUS_FIELDS,
+                                          LEGACY_FIELDS, ENDPOINT_FIELDS):
                 raise ValueError(f"incompatible result CSV header: {path}; use a new output_csv")
             with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8",
                                              dir=path.parent, delete=False) as target:
@@ -265,9 +265,6 @@ def upgrade_csv(path):
                 writer.writeheader()
                 for row in reader:
                     row["rank_list"] = json.dumps(legacy_rank_list(row))
-                    topology = re.search(r"_n([0-9]+)_p([0-9]+)_", row.get("case_id", ""))
-                    row["comm_layer_list"] = (f"(1,{topology.group(1)},{topology.group(2)})"
-                                               if topology else "")
                     writer.writerow(row)
                 target.flush()
                 os.fsync(target.fileno())
