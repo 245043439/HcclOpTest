@@ -141,15 +141,15 @@ collected on the target cluster.
 
 ```bash
 # 基线：单机双卡，默认 float32、1 MiB、10 次预热、50 次测量。
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
   scripts/python/compare_allreduce.py run --output ./allreduce_baseline
 
 # 每个 rank 由普通 msprof 包装，保留相同的端到端计时。
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
   scripts/python/compare_allreduce.py run --msprof --output ./allreduce_profiled
 
 # ACL Graph 模式；可添加 --msprof 采集，也可改为 --execution-mode ascend_ir。
-torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
   scripts/python/compare_allreduce.py run --execution-mode aclgraph --output ./allreduce_aclgraph
 ```
 
@@ -168,6 +168,8 @@ HCCL patch 和全图编译，`aclgraph` 使用 NPU 图捕获与重放。编译�
 输入为零，避免重复原地 SUM 溢出。计时范围与 `run_bench.py` 相同，但不执行它的逐轮
 耗时归约 AllReduce，而是将各 rank 原始耗时保存到 `rank_<rank>.json` 后离线取最大值。
 因此计时区间外的执行节奏与原脚本略有不同。此用例不做数值正确性验证。
+每个 rank 测量结束后会打印样本平均值、Q1/Q2/Q3/Q4 和总体方差；分位数按最近秩计算，
+Q4 表示最大值，方差单位为 us²。
 
 `--msprof` 使用 `--task-time=on --hccl=on --ai-core=off --type=text`，
 产物分别保存在 `profiler/rank_<rank>/`。使用完整 HCCL 通信算子时间，

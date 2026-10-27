@@ -5,12 +5,19 @@ import json
 import os
 from pathlib import Path
 import socket
+import statistics
 import subprocess
 import sys
 import time
 
 
 DTYPE_BYTES = {"float16": 2, "float32": 4, "bfloat16": 2}
+
+
+def sample_summary(samples):
+    ordered = sorted(samples)
+    quartiles = [ordered[(len(ordered) * index + 3) // 4 - 1] for index in range(1, 5)]
+    return statistics.fmean(samples), quartiles, statistics.pvariance(samples)
 
 
 def graph_callable(fn, mode, torch):
@@ -109,6 +116,11 @@ def run(args):
         with result_path.open("x", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2)
         print(f"rank {rank}: saved {len(samples)} samples to {result_path}", flush=True)
+        mean, quartiles, variance = sample_summary(samples)
+        print(f"rank {rank}: mean={mean:.3f} us; "
+              f"Q1={quartiles[0]:.3f}, Q2={quartiles[1]:.3f}, "
+              f"Q3={quartiles[2]:.3f}, Q4={quartiles[3]:.3f} us; "
+              f"variance={variance:.3f} us^2", flush=True)
     finally:
         dist.destroy_process_group()
     return 0
