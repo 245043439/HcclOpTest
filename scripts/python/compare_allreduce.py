@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal AllReduce benchmark with eager and graph execution modes."""
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,8 @@ def run(args):
         raise ValueError("size-bytes must be positive and divisible by dtype element size")
     if args.warmup < 0 or args.repeat <= 0:
         raise ValueError("warmup must be nonnegative and repeat must be positive")
+    if args.msprof and args.python_stack:
+        raise ValueError("--msprof and --python-stack cannot be used together")
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -94,19 +97,35 @@ def run(args):
         torch.npu.synchronize()
         dist.barrier()
         samples = []
-        for _ in range(args.repeat):
-            dist.barrier()
-            torch.npu.synchronize()
-            start = time.perf_counter()
-            run_fn()
-            torch.npu.synchronize()
-            samples.append((time.perf_counter() - start) * 1_000_000)
+        profiler = nullcontext()
+        if args.python_stack:
+            stack_dir = args.output / "python_profiler" / f"rank_{rank}"
+            stack_dir.mkdir(parents=True, exist_ok=False)
+            profiler = torch_npu.profiler.profile(
+                activities=[torch_npu.profiler.ProfilerActivity.CPU,
+                            torch_npu.profiler.ProfilerActivity.NPU],
+                schedule=torch_npu.profiler.schedule(
+                    wait=0, warmup=0, active=args.repeat, repeat=1),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(stack_dir)),
+                with_stack=True,
+            )
+        with profiler:
+            for _ in range(args.repeat):
+                dist.barrier()
+                torch.npu.synchronize()
+                start = time.perf_counter()
+                run_fn()
+                torch.npu.synchronize()
+                samples.append((time.perf_counter() - start) * 1_000_000)
+                if args.python_stack:
+                    profiler.step()
         payload = {
             "schema_version": 1, "rank": rank, "local_rank": local_rank,
             "world_size": world_size, "size_bytes": args.size_bytes, "dtype": args.dtype,
             "warmup": args.warmup, "repeat": args.repeat, "execution_mode": args.execution_mode,
             "expansion_mode": os.environ.get("HCCL_OP_EXPANSION_MODE", "DEFAULT"),
-            "profiled": args.profiled, "samples_us": samples,
+            "profiled": args.profiled or args.python_stack,
+            "python_stack": args.python_stack, "samples_us": samples,
             "metadata": {"hostname": socket.gethostname(),
                          "hardware": getattr(torch.npu.get_device_properties(local_rank), "name", "unknown"),
                          "torch_version": torch.__version__,
@@ -137,6 +156,8 @@ def main(argv=None):
     runner.add_argument("--execution-mode", choices=("eager", "ascend_ir", "aclgraph"), default="eager")
     runner.add_argument("--output", type=Path, required=True)
     runner.add_argument("--msprof", action="store_true")
+    runner.add_argument("--python-stack", action="store_true",
+                        help="collect Python call stacks with torch_npu.profiler")
     runner.add_argument("--profiled", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:

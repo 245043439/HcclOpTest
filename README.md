@@ -151,6 +151,10 @@ torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
 # ACL Graph 模式；可添加 --msprof 采集，也可改为 --execution-mode ascend_ir。
 torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
   scripts/python/compare_allreduce.py run --execution-mode aclgraph --output ./allreduce_aclgraph
+
+# 采集 Python 调用栈（该采集方式使用 torch_npu.profiler，不要同时添加 --msprof）。
+torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
+  scripts/python/compare_allreduce.py run --python-stack --output ./allreduce_python_stack
 ```
 
 基线和 profiling 是两次独立采集；本脚本只负责运行并保存各 rank 的原始结果，不提供两次结果的离线对比。
@@ -159,6 +163,9 @@ torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
 HCCL patch 和全图编译，`aclgraph` 使用 NPU 图捕获与重放。编译、捕获及其初始化调用在预热和
 计时之前完成；msprof 产物可能包含这些额外调用。图模式不可用或执行失败时直接报错。
 所选模式会透传给 msprof 子进程，并写入各 rank JSON 的 `execution_mode` 字段。
+`--python-stack` 使用 `torch_npu.profiler` 同时采集 CPU/NPU 活动并启用 `with_stack=True`，
+结果写入 `python_profiler/rank_<rank>/`。该选项不能与 `--msprof` 同时使用；调用栈采集会带来额外开销，
+对应的耗时用于检查调用路径，不代表未开启采集时的基准性能。
 可分别测试 1024、1048576、67108864 字节；每个大小的基线和 profiling 参数须一致，
 并使用独立输出目录。所有输出目录应为新路径，重跑时不要混入历史文件。
 脚本记录版本元数据；若需记录 CANN 版本，请在两次运行前设置准确的 `CANN_VERSION`。
