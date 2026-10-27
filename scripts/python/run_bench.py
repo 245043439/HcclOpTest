@@ -100,7 +100,6 @@ def benchmark(fn, group, warmup, repeat, participants=None, graph_runner=None,
     for iteration in range(repeat):
         STAGE = f"{progress_label} iteration {iteration + 1}/{repeat} barrier"
         dist.barrier(group=group)
-        torch.npu.synchronize()
         STAGE = f"{progress_label} iteration {iteration + 1}/{repeat} communication/synchronize"
         start = time.perf_counter()
         invoke()

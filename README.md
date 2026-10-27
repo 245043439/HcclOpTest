@@ -134,30 +134,37 @@ the target A5/CANN stack before expanding sizes and group counts; this local
 environment does not include NPU dependencies, so real measurements must be
 collected on the target cluster.
 
-## AllReduce 最小用例
+## 单算子最小用例
 
-`scripts/python/compare_allreduce.py` 是独立的 AllReduce 最小用例，默认使用 eager 模式。
+`scripts/python/singe_op.py` 支持 AllReduce 和 AllToAll，默认使用 AllReduce 和 eager 模式。
 在目标服务器准备好 PyTorch、torch_npu、CANN 和 `msprof` 后，从仓库根目录运行：
 
 ```bash
 # 基线：单机双卡，默认 float32、1 MiB、10 次预热、50 次测量。
 torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
-  scripts/python/compare_allreduce.py run --output ./allreduce_baseline
+  scripts/python/singe_op.py run --output ./allreduce_baseline
+
+# AllToAll：单机双卡，每个 rank 总输入 1 MiB。
+torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
+  scripts/python/singe_op.py run --operator alltoall --output ./alltoall_baseline
 
 # 每个 rank 由普通 msprof 包装，保留相同的端到端计时。
 torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
-  scripts/python/compare_allreduce.py run --msprof --output ./allreduce_profiled
+  scripts/python/singe_op.py run --msprof --output ./allreduce_profiled
 
 # ACL Graph 模式；可添加 --msprof 采集，也可改为 --execution-mode ascend_ir。
 torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
-  scripts/python/compare_allreduce.py run --execution-mode aclgraph --output ./allreduce_aclgraph
+  scripts/python/singe_op.py run --execution-mode aclgraph --output ./allreduce_aclgraph
 
 # 采集 Python 调用栈（该采集方式使用 torch_npu.profiler，不要同时添加 --msprof）。
 torchrun --nnodes=1 --nproc-per-node=2 --master_addr=127.0.0.1 \
-  scripts/python/compare_allreduce.py run --python-stack --output ./allreduce_python_stack
+  scripts/python/singe_op.py run --python-stack --output ./allreduce_python_stack
 ```
 
 基线和 profiling 是两次独立采集；本脚本只负责运行并保存各 rank 的原始结果，不提供两次结果的离线对比。
+通过 `--operator {allreduce,alltoall}` 选择算子。AllToAll 使用 `all_to_all_single` 等分交换，
+`--size-bytes` 表示每个 rank 的总输入大小，输出大小相同，每个目标 rank 分得其中的 `1 / world_size`；
+元素数量必须能被 `world_size` 整除，口径与矩阵基准一致。JSON 中新增 `operator` 字段记录所选算子。
 支持 `--size-bytes`、`--dtype {float16,float32,bfloat16}`、`--warmup` 和 `--repeat`。
 `--execution-mode {eager,ascend_ir,aclgraph}` 与矩阵基准含义一致：`ascend_ir` 使用 TorchAir
 HCCL patch 和全图编译，`aclgraph` 使用 NPU 图捕获与重放。编译、捕获及其初始化调用在预热和
@@ -172,7 +179,7 @@ Level1 采集会带来额外开销，因此对应耗时用于检查调用路径�
 脚本记录版本元数据；若需记录 CANN 版本，请在两次运行前设置准确的 `CANN_VERSION`。
 `HCCL_OP_EXPANSION_MODE` 原样继承并记录，不自动修改。
 
-每轮顺序为 barrier → NPU 同步 → `perf_counter()` → AllReduce → NPU 同步 → 停止计时。
+每轮顺序为 barrier → NPU 同步 → `perf_counter()` → 通信算子 → NPU 同步 → 停止计时。
 输入为零，避免重复原地 SUM 溢出。计时范围与 `run_bench.py` 相同，但不执行它的逐轮
 耗时归约 AllReduce，而是将各 rank 原始耗时保存到 `rank_<rank>.json` 后离线取最大值。
 因此计时区间外的执行节奏与原脚本略有不同。此用例不做数值正确性验证。
@@ -189,7 +196,7 @@ Q4 表示最大值，方差单位为 us²。
 `profiler/rank_<rank>/`。需要查看通信耗时或对照不同采集时，请直接使用这些原始文件和 msprof
 导出结果自行分析。脚本不负责解析 `op_summary*.csv`，也不比较基线与 profiling 两次运行。
 
-CPU 回归测试：`python3 -m unittest discover -s tests -p 'test_compare_allreduce.py' -v`。
+CPU 回归测试：`python3 -m unittest discover -s tests -p 'test_singe_op.py' -v`。
 双卡实测在目标服务器完成；CPU 测试不代表已验证目标环境的 profiler 兼容性。
 
 ## 异常与卡住诊断

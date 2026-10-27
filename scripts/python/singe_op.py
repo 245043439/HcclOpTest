@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal AllReduce benchmark with eager and graph execution modes."""
+"""Single-operator AllReduce/AllToAll benchmark with eager and graph execution modes."""
 import argparse
 from contextlib import nullcontext
 import json
@@ -66,6 +66,8 @@ def run(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     if world_size < 2:
         raise ValueError("launch with torchrun and at least two ranks")
+    if args.operator == "alltoall" and args.size_bytes % (DTYPE_BYTES[args.dtype] * world_size):
+        raise ValueError("alltoall element count must be divisible by world size")
     args.output.mkdir(parents=True, exist_ok=True)
     result_path = args.output / f"rank_{rank}.json"
     if result_path.exists():
@@ -78,7 +80,7 @@ def run(args):
                    "run", "--profiled", "--output", str(args.output.resolve()),
                    "--size-bytes", str(args.size_bytes), "--dtype", args.dtype,
                    "--warmup", str(args.warmup), "--repeat", str(args.repeat),
-                   "--execution-mode", args.execution_mode]
+                   "--execution-mode", args.execution_mode, "--operator", args.operator]
         return subprocess.run(command, check=False).returncode
 
     # CLI help deliberately does not import any NPU dependencies.
@@ -91,7 +93,12 @@ def run(args):
     try:
         x = torch.zeros(args.size_bytes // DTYPE_BYTES[args.dtype],
                         dtype=getattr(torch, args.dtype), device=f"npu:{local_rank}")
-        run_fn = graph_callable(lambda: dist.all_reduce(x), args.execution_mode, torch)
+        if args.operator == "alltoall":
+            out = torch.empty_like(x)
+            fn = lambda: dist.all_to_all_single(out, x)
+        else:
+            fn = lambda: dist.all_reduce(x)
+        run_fn = graph_callable(fn, args.execution_mode, torch)
         for _ in range(args.warmup):
             run_fn()
         torch.npu.synchronize()
@@ -123,6 +130,7 @@ def run(args):
                     profiler.step()
         payload = {
             "schema_version": 1, "rank": rank, "local_rank": local_rank,
+            "operator": args.operator,
             "world_size": world_size, "size_bytes": args.size_bytes, "dtype": args.dtype,
             "warmup": args.warmup, "repeat": args.repeat, "execution_mode": args.execution_mode,
             "expansion_mode": os.environ.get("HCCL_OP_EXPANSION_MODE", "DEFAULT"),
@@ -151,6 +159,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     runner = commands.add_parser("run", help="launch under torchrun, optionally wrap each rank with msprof")
+    runner.add_argument("--operator", choices=("allreduce", "alltoall"), default="allreduce")
     runner.add_argument("--size-bytes", type=int, default=1024 ** 2)
     runner.add_argument("--dtype", choices=DTYPE_BYTES, default="float32")
     runner.add_argument("--warmup", type=int, default=10)
