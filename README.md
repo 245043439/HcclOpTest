@@ -134,9 +134,9 @@ the target A5/CANN stack before expanding sizes and group counts; this local
 environment does not include NPU dependencies, so real measurements must be
 collected on the target cluster.
 
-## AllReduce eager 最小用例
+## AllReduce 最小用例
 
-`scripts/python/compare_allreduce.py` 是独立的 eager 最小用例，不改变矩阵测试。
+`scripts/python/compare_allreduce.py` 是独立的 AllReduce 最小用例，默认使用 eager 模式。
 在目标服务器准备好 PyTorch、torch_npu、CANN 和 `msprof` 后，从仓库根目录运行：
 
 ```bash
@@ -148,10 +148,17 @@ torchrun --standalone --nnodes=1 --nproc-per-node=2 \
 torchrun --standalone --nnodes=1 --nproc-per-node=2 \
   scripts/python/compare_allreduce.py run --msprof --output ./allreduce_profiled
 
+# ACL Graph 模式；可添加 --msprof 采集，也可改为 --execution-mode ascend_ir。
+torchrun --standalone --nnodes=1 --nproc-per-node=2 \
+  scripts/python/compare_allreduce.py run --execution-mode aclgraph --output ./allreduce_aclgraph
 ```
 
 基线和 profiling 是两次独立采集；本脚本只负责运行并保存各 rank 的原始结果，不提供两次结果的离线对比。
 支持 `--size-bytes`、`--dtype {float16,float32,bfloat16}`、`--warmup` 和 `--repeat`。
+`--execution-mode {eager,ascend_ir,aclgraph}` 与矩阵基准含义一致：`ascend_ir` 使用 TorchAir
+HCCL patch 和全图编译，`aclgraph` 使用 NPU 图捕获与重放。编译、捕获及其初始化调用在预热和
+计时之前完成；msprof 产物可能包含这些额外调用。图模式不可用或执行失败时直接报错。
+所选模式会透传给 msprof 子进程，并写入各 rank JSON 的 `execution_mode` 字段。
 可分别测试 1024、1048576、67108864 字节；每个大小的基线和 profiling 参数须一致，
 并使用独立输出目录。所有输出目录应为新路径，重跑时不要混入历史文件。
 脚本记录版本元数据；若需记录 CANN 版本，请在两次运行前设置准确的 `CANN_VERSION`。

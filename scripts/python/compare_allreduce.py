@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal eager AllReduce benchmark."""
+"""Minimal AllReduce benchmark with eager and graph execution modes."""
 import argparse
 import json
 import os
@@ -11,6 +11,39 @@ import time
 
 
 DTYPE_BYTES = {"float16": 2, "float32": 4, "bfloat16": 2}
+
+
+def graph_callable(fn, mode, torch):
+    """Prepare graphs before warmup, following run_bench.py's execution modes."""
+    if mode == "eager":
+        return fn
+    if mode == "ascend_ir":
+        try:
+            import torchair
+        except ImportError as exc:
+            raise RuntimeError("TorchAir is unavailable") from exc
+        patch = getattr(torchair, "patch_for_hcom", None)
+        if patch is None:
+            raise RuntimeError("TorchAir patch_for_hcom API is unavailable")
+        patch()
+        compiled = torch.compile(fn, backend=torchair.get_npu_backend(), fullgraph=True)
+        compiled()
+        torch.npu.synchronize()
+        return compiled
+    if mode == "aclgraph":
+        graph_type = getattr(torch.npu, "NPUGraph", None)
+        graph_context = getattr(torch.npu, "graph", None)
+        if graph_type is None or graph_context is None:
+            raise RuntimeError("torch_npu aclgraph capture API is unavailable")
+        # Initialize HCCL communicators and workspaces before capture.
+        fn()
+        torch.npu.synchronize()
+        graph = graph_type()
+        with graph_context(graph):
+            fn()
+        torch.npu.synchronize()
+        return graph.replay
+    raise ValueError(f"unknown execution mode: {mode}")
 
 
 def run(args):
@@ -34,7 +67,8 @@ def run(args):
                    "--ai-core=off", "--type=text", sys.executable, str(Path(__file__).resolve()),
                    "run", "--profiled", "--output", str(args.output.resolve()),
                    "--size-bytes", str(args.size_bytes), "--dtype", args.dtype,
-                   "--warmup", str(args.warmup), "--repeat", str(args.repeat)]
+                   "--warmup", str(args.warmup), "--repeat", str(args.repeat),
+                   "--execution-mode", args.execution_mode]
         return subprocess.run(command, check=False).returncode
 
     # CLI help deliberately does not import any NPU dependencies.
@@ -47,8 +81,9 @@ def run(args):
     try:
         x = torch.zeros(args.size_bytes // DTYPE_BYTES[args.dtype],
                         dtype=getattr(torch, args.dtype), device=f"npu:{local_rank}")
+        run_fn = graph_callable(lambda: dist.all_reduce(x), args.execution_mode, torch)
         for _ in range(args.warmup):
-            dist.all_reduce(x)
+            run_fn()
         torch.npu.synchronize()
         dist.barrier()
         samples = []
@@ -56,13 +91,13 @@ def run(args):
             dist.barrier()
             torch.npu.synchronize()
             start = time.perf_counter()
-            dist.all_reduce(x)
+            run_fn()
             torch.npu.synchronize()
             samples.append((time.perf_counter() - start) * 1_000_000)
         payload = {
             "schema_version": 1, "rank": rank, "local_rank": local_rank,
             "world_size": world_size, "size_bytes": args.size_bytes, "dtype": args.dtype,
-            "warmup": args.warmup, "repeat": args.repeat, "execution_mode": "eager",
+            "warmup": args.warmup, "repeat": args.repeat, "execution_mode": args.execution_mode,
             "expansion_mode": os.environ.get("HCCL_OP_EXPANSION_MODE", "DEFAULT"),
             "profiled": args.profiled, "samples_us": samples,
             "metadata": {"hostname": socket.gethostname(),
@@ -87,6 +122,7 @@ def main(argv=None):
     runner.add_argument("--dtype", choices=DTYPE_BYTES, default="float32")
     runner.add_argument("--warmup", type=int, default=10)
     runner.add_argument("--repeat", type=int, default=50)
+    runner.add_argument("--execution-mode", choices=("eager", "ascend_ir", "aclgraph"), default="eager")
     runner.add_argument("--output", type=Path, required=True)
     runner.add_argument("--msprof", action="store_true")
     runner.add_argument("--profiled", action="store_true", help=argparse.SUPPRESS)
