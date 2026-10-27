@@ -108,6 +108,8 @@ def run(args):
                     wait=0, warmup=0, active=args.repeat, repeat=1),
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(stack_dir)),
                 with_stack=True,
+                experimental_config=torch_npu.profiler._ExperimentalConfig(
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1),
             )
         with profiler:
             for _ in range(args.repeat):
