@@ -199,6 +199,10 @@ Q4 表示最大值，方差单位为 us²。
 CPU 回归测试：`python3 -m unittest discover -s tests -p 'test_singe_op.py' -v`。
 双卡实测在目标服务器完成；CPU 测试不代表已验证目标环境的 profiler 兼容性。
 
+## 单 node 启动分布与同步时延外推
+
+独立工具及使用说明见 [node_sync_model/README.md](node_sync_model/README.md)。
+
 ## 异常与卡住诊断
 
 运行器按批次和恢复次数创建日志目录，实时写入 `launcher.log`，每 30 秒提示等待时间。
