@@ -1,6 +1,9 @@
 """CPU-only regressions for the empirical launch-span model."""
 
 import importlib.util
+import contextlib
+import csv
+import io
 import itertools
 import json
 from pathlib import Path
@@ -16,6 +19,41 @@ SPEC.loader.exec_module(model)
 
 
 class NodeSyncModelTests(unittest.TestCase):
+    def test_node_filter_changes_fit_but_preserves_validation_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train, valid = root / "train.csv", root / "valid.csv"
+            train.write_text("iteration,node_id,A_us,B_us\n"
+                             "1,01,0,2\n2,01,2,4\n1,1,100,200\n")
+            valid.write_text("iteration,node_id,A_us,B_us\n1,01,0,2\n1,1,10,20\n")
+            for node_id, expected, count in [(None, 104 / 3, 3), ("01", 2, 2)]:
+                output = root / str(node_id)
+                argv = ["--input", str(train), "--nodes", "1", "2",
+                        "--validation", str(valid), "--output-dir", str(output)]
+                if node_id is not None:
+                    argv.extend(["--node-id", node_id])
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    model.main(argv)
+                report = json.loads((output / "report.json").read_text())
+                self.assertAlmostEqual(report["predictions"][0]["expected_sync_us"],
+                                       expected)
+                self.assertEqual(report["sample_count"], count)
+                self.assertEqual(report["node_id_filter"], node_id)
+                self.assertEqual(report["validation"][0]["node_count"], 2)
+                self.assertEqual(report["validation"][0]["observed_sync_us"], 20)
+                if node_id:
+                    with (output / "cdf.csv").open() as stream:
+                        self.assertEqual([float(r["t_us"]) for r in csv.DictReader(stream)], [0, 2, 4])
+                    with (output / "node_summary.csv").open() as stream:
+                        self.assertEqual([r["node_id"] for r in csv.DictReader(stream)], ["01"])
+            output = root / "missing"
+            with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
+                model.main(["--input", str(train), "--node-id", "missing", "--nodes", "2",
+                            "--output-dir", str(output)])
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("no training samples match", stderr.getvalue())
+            self.assertFalse(output.exists())
+
     def test_integral_matches_exhaustive_paired_sampling(self):
         pairs = [(-3, -1), (0, 4), (0, 0), (2, 4)]
         samples = [(str(i), "0", a, b) for i, (a, b) in enumerate(pairs)]

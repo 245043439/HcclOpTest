@@ -35,6 +35,20 @@ python3 node_sync_model/node_sync_model.py \
 `区间宽度 × [1 - F_B(t)^N - (1 - F_A(t))^N]`，无需设置积分步长或假设正态分布。
 每个 node 每轮的样本对等权参与估计，不要求恰好采集 50 轮。
 
+可使用 `--node-id 0` 仅以指定节点的样本估计 CDF：
+
+```bash
+python3 node_sync_model/node_sync_model.py \
+  --input samples_2nodes.csv --node-id 0 --nodes 1 2 4 8 16 \
+  --output-dir sync_model_node0
+```
+
+默认使用全部节点。`--node-id` 按字符串精确匹配 CSV 中去除首尾空白的 `node_id`
+（例如 `01` 与 `1` 不同），没有匹配样本时报错。输入 CSV 仍会完整校验。
+CDF、预测、节点摘要及报告中的训练样本统计均基于过滤后的数据；
+`report.json` 的 `node_id_filter` 记录过滤值，未指定时为 null。
+`--nodes` 仍表示目标预测规模；`--validation` 文件使用全部节点计算观测跨度。
+
 `node_summary.csv` 保存各 node 的样本数、A/B 均值和边界，供检查固定节点差异。
 提供 `--validation` 时，`validation.csv` 比较每轮 `max(B) - min(A)` 的观测均值与预测均值，
 要求同一验证文件每轮 node 集合完整且一致。`error_us` 为预测减观测，

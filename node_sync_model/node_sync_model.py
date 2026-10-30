@@ -102,6 +102,7 @@ def write_csv(path, fields, rows):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path, help="training sample CSV")
+    parser.add_argument("--node-id", help="fit CDF using only this training node ID (exact string match)")
     parser.add_argument("--nodes", required=True, nargs="+", type=int,
                         help="positive target node counts, e.g. 1 2 4 8")
     parser.add_argument("--validation", action="append", default=[], type=Path,
@@ -113,6 +114,10 @@ def main(argv=None):
         if any(n < 1 for n in args.nodes):
             raise ValueError("--nodes values must be positive")
         samples = read_samples(args.input)
+        if args.node_id is not None:
+            samples = [sample for sample in samples if sample[1] == args.node_id]
+            if not samples:
+                raise ValueError(f"no training samples match --node-id {args.node_id!r}")
         cdf = empirical_cdf(samples)
         predictions = [{"node_count": n, "expected_sync_us": expected_span(cdf, n)}
                        for n in sorted(set(args.nodes))]
@@ -130,6 +135,7 @@ def main(argv=None):
                                                   if observed else None)})
         report = {
             "input": str(args.input), "sample_count": len(samples),
+            "node_id_filter": args.node_id,
             "iteration_count": len({row[0] for row in samples}),
             "training_node_count": len({row[1] for row in samples}),
             "empirical_span_limit_us": cdf[-1][0] - cdf[0][0],
