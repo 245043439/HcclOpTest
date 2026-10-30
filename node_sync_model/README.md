@@ -1,6 +1,8 @@
 # 单 node 启动分布与同步时延外推
 
-`node_sync_model/node_sync_model.py` 实现通信建模文档第 4、5 节，仅依赖 Python 标准库。
+`node_sync_model/node_sync_model.py` 实现通信建模文档第 4、5 节。数值计算仅依赖 Python 标准库，
+默认绘图需要 Matplotlib，可在仓库根目录执行 `pip install -r node_sync_model/requirements.txt` 安装。
+使用 `--no-plots` 可跳过绘图及该依赖。
 输入为第 3 节的样本 CSV，时间单位统一为微秒，每个 `(iteration, node_id)` 一行：
 
 ```csv
@@ -31,6 +33,16 @@ python3 node_sync_model/node_sync_model.py \
 
 输出目录必须是新路径。`cdf.csv` 保存所有不同样本取值处的右连续经验 CDF
 `t_us,F_A,F_B`；`predictions.csv` 保存预测值和误差，终端也输出相同结果。
+默认还生成 `cdf.png` 与 `pdf.png`，每张图同时显示 A、B 两个分布：
+
+- `cdf.png`：右连续经验 CDF 阶梯图，横轴为启动延迟（us），纵轴为累积概率。
+- `pdf.png`：密度归一化直方图，纵轴为概率密度（1/us），各分布的总面积为 1。
+  A、B 共用等宽分箱，分箱数为 `ceil(log2(M)) + 1`，M 为拟合样本对数。
+  全部样本取值相同时，使用该值两侧的有限宽度区间绘图。
+
+两张图均使用 `--node-id` 过滤后的拟合样本。经验分布是离散分布，没有连续 PDF；
+这里的 PDF 图为直方图密度估计，其形状受分箱影响，不参与预测积分。
+
 计算按相邻样本取值划分区间，累加
 `区间宽度 × [1 - F_B(t)^N - (1 - F_A(t))^N]`，无需设置积分步长或假设正态分布。
 每个 node 每轮的样本对等权参与估计，不要求恰好采集 50 轮。

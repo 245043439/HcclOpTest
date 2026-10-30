@@ -122,10 +122,54 @@ def write_csv(path, fields, rows):
         writer.writerows(rows)
 
 
+def plot_distributions(samples, cdf, output_dir, node_id=None):
+    """Plot empirical CDFs and normalized histograms using the fitted samples."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    a = [row[2] for row in samples]
+    b = [row[3] for row in samples]
+    lower, upper = cdf[0][0], cdf[-1][0]
+    margin = (upper - lower) * 0.05 if upper > lower else max(abs(lower) * 0.05, 0.5)
+    label = f"node_id={node_id}" if node_id is not None else "all training nodes"
+    subtitle = f"{label}; {len(samples)} sample pairs"
+
+    figure = Figure(figsize=(8, 5), layout="constrained")
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    times = [lower - margin] + [row[0] for row in cdf] + [upper + margin]
+    for column, name, color in [(1, "A: earliest launch", "tab:blue"),
+                                (2, "B: latest launch", "tab:orange")]:
+        values = [0.0] + [row[column] for row in cdf] + [1.0]
+        axis.step(times, values, where="post", label=name, color=color)
+    axis.set(xlabel="Launch delay (us)", ylabel="Cumulative probability",
+             title=f"Empirical CDF\n{subtitle}", ylim=(-0.03, 1.03))
+    axis.grid(alpha=0.25)
+    axis.legend()
+    figure.savefig(output_dir / "cdf.png", dpi=160)
+
+    figure = Figure(figsize=(8, 5), layout="constrained")
+    FigureCanvasAgg(figure)
+    axis = figure.subplots()
+    # Shared Sturges bins make A and B densities directly comparable.
+    bin_count = math.ceil(math.log2(len(samples))) + 1
+    hist_lower, hist_upper = (lower, upper) if upper > lower else (lower - margin, upper + margin)
+    bins = [hist_lower + (hist_upper - hist_lower) * i / bin_count
+            for i in range(bin_count + 1)]
+    axis.hist(a, bins=bins, density=True, alpha=0.45, color="tab:blue", label="A: earliest launch")
+    axis.hist(b, bins=bins, density=True, alpha=0.45, color="tab:orange", label="B: latest launch")
+    axis.set(xlabel="Launch delay (us)", ylabel="Probability density (1/us)",
+             title=f"PDF estimate (normalized histogram)\n{subtitle}")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    figure.savefig(output_dir / "pdf.png", dpi=160)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path, help="training sample CSV")
     parser.add_argument("--node-id", help="fit CDF using only this training node ID (exact string match)")
+    parser.add_argument("--no-plots", action="store_true", help="skip CDF/PDF plots (no matplotlib required)")
     parser.add_argument("--nodes", required=True, nargs="+", type=int,
                         help="positive target node counts, e.g. 1 2 4 8")
     parser.add_argument("--validation", action="append", default=[], type=Path,
@@ -172,6 +216,12 @@ def main(argv=None):
                             "No confidence intervals or P95/P99 are estimated"],
         }
         encoded_report = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+        if not args.no_plots:
+            try:
+                import matplotlib
+            except ImportError as exc:
+                raise ValueError("plotting requires matplotlib: pip install -r "
+                                 "node_sync_model/requirements.txt; or use --no-plots") from exc
         args.output_dir.mkdir(parents=True, exist_ok=False)
         write_csv(args.output_dir / "cdf.csv", ["t_us", "F_A", "F_B"],
                   [dict(zip(["t_us", "F_A", "F_B"], row)) for row in cdf])
@@ -182,6 +232,8 @@ def main(argv=None):
         if validation:
             write_csv(args.output_dir / "validation.csv", list(validation[0]), validation)
         (args.output_dir / "report.json").write_text(encoded_report + "\n", encoding="utf-8")
+        if not args.no_plots:
+            plot_distributions(samples, cdf, args.output_dir, args.node_id)
     except (OSError, ValueError, OverflowError) as exc:
         parser.error(str(exc))
     writer = csv.DictWriter(sys.stdout, fieldnames=list(predictions[0]))

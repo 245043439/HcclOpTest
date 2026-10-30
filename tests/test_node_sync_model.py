@@ -19,6 +19,20 @@ SPEC.loader.exec_module(model)
 
 
 class NodeSyncModelTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib is not installed")
+    def test_plots_support_constant_and_varied_samples(self):
+        cases = [[("1", "0", 3, 3)],
+                 [("1", "0", 0, 2), ("2", "0", 2, 4), ("3", "0", 2, 5)]]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for samples in cases:
+                with self.subTest(samples=samples):
+                    model.plot_distributions(samples, model.empirical_cdf(samples), output, "0")
+                    for name in ["cdf.png", "pdf.png"]:
+                        image = (output / name).read_bytes()
+                        self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
+                        self.assertGreater(len(image), 1000)
+
     def test_error_averages_per_step_spans_for_required_nodes(self):
         samples = [("1", "0", 0, 2), ("1", "1", 4, 8), ("1", "2", -100, 100),
                    ("2", "0", 100, 102), ("2", "1", 101, 104)]
@@ -45,7 +59,7 @@ class NodeSyncModelTests(unittest.TestCase):
                              "1,0,0,2\n1,1,4,8\n2,0,2,4\n2,1,3,6\n")
             output = root / "output"
             with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
-                model.main(["--input", str(train), "--node-id", "0", "--nodes", "2", "4",
+                model.main(["--no-plots", "--input", str(train), "--node-id", "0", "--nodes", "2", "4",
                             "--output-dir", str(output)])
             report = json.loads((output / "report.json").read_text())
             row = report["predictions"][0]
@@ -69,7 +83,7 @@ class NodeSyncModelTests(unittest.TestCase):
             valid.write_text("iteration,node_id,A_us,B_us\n1,01,0,2\n1,1,10,20\n")
             for node_id, expected, count in [(None, 104 / 3, 3), ("01", 2, 2)]:
                 output = root / str(node_id)
-                argv = ["--input", str(train), "--nodes", "1", "2",
+                argv = ["--no-plots", "--input", str(train), "--nodes", "1", "2",
                         "--validation", str(valid), "--output-dir", str(output)]
                 if node_id is not None:
                     argv.extend(["--node-id", node_id])
@@ -89,7 +103,7 @@ class NodeSyncModelTests(unittest.TestCase):
                         self.assertEqual([r["node_id"] for r in csv.DictReader(stream)], ["01"])
             output = root / "missing"
             with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
-                model.main(["--input", str(train), "--node-id", "missing", "--nodes", "2",
+                model.main(["--no-plots", "--input", str(train), "--node-id", "missing", "--nodes", "2",
                             "--output-dir", str(output)])
             self.assertEqual(error.exception.code, 2)
             self.assertIn("no training samples match", stderr.getvalue())
@@ -139,7 +153,7 @@ class NodeSyncModelTests(unittest.TestCase):
             valid.write_text("iteration,node_id,A_us,B_us\n1,0,3,3\n1,1,3,3\n")
             output = root / "output"
             self.assertEqual(model.main([
-                "--input", str(train), "--nodes", "1", "2", "4",
+                "--no-plots", "--input", str(train), "--nodes", "1", "2", "4",
                 "--validation", str(valid), "--output-dir", str(output)]), 0)
             report = json.loads((output / "report.json").read_text())
             self.assertEqual([r["expected_sync_us"] for r in report["predictions"]],
