@@ -92,6 +92,29 @@ def node_summary(samples):
             for node, pairs in sorted(groups.items())]
 
 
+def prediction_with_error(samples, nodes, predicted):
+    """Compare to the mean per-step span of IDs 0..N-1 in unfiltered input."""
+    rounds = defaultdict(dict)
+    for iteration, node, a, b in samples:
+        rounds[iteration][node] = (a, b)
+    result = {"node_count": nodes, "expected_sync_us": predicted,
+              "y_true_mean_us": None, "error_us": None,
+              "absolute_error_us": None, "relative_error": None,
+              "iteration_count": len(rounds), "error_status": "missing_required_nodes"}
+    if any(len(rows) < nodes for rows in rounds.values()):
+        return result
+    required = [str(i) for i in range(nodes)]
+    if any(any(node not in rows for node in required) for rows in rounds.values()):
+        return result
+    spans = [max(rows[node][1] for node in required)
+             - min(rows[node][0] for node in required) for rows in rounds.values()]
+    observed = math.fsum(span / len(spans) for span in spans)
+    error = predicted - observed
+    result.update(y_true_mean_us=observed, error_us=error, absolute_error_us=abs(error),
+                  relative_error=error / observed if observed else None, error_status="ok")
+    return result
+
+
 def write_csv(path, fields, rows):
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -113,13 +136,14 @@ def main(argv=None):
     try:
         if any(n < 1 for n in args.nodes):
             raise ValueError("--nodes values must be positive")
-        samples = read_samples(args.input)
+        all_samples = read_samples(args.input)
+        samples = all_samples
         if args.node_id is not None:
             samples = [sample for sample in samples if sample[1] == args.node_id]
             if not samples:
                 raise ValueError(f"no training samples match --node-id {args.node_id!r}")
         cdf = empirical_cdf(samples)
-        predictions = [{"node_count": n, "expected_sync_us": expected_span(cdf, n)}
+        predictions = [prediction_with_error(all_samples, n, expected_span(cdf, n))
                        for n in sorted(set(args.nodes))]
         validation = []
         for path in args.validation:
@@ -152,7 +176,7 @@ def main(argv=None):
         write_csv(args.output_dir / "cdf.csv", ["t_us", "F_A", "F_B"],
                   [dict(zip(["t_us", "F_A", "F_B"], row)) for row in cdf])
         write_csv(args.output_dir / "predictions.csv",
-                  ["node_count", "expected_sync_us"], predictions)
+                  list(predictions[0]), predictions)
         summaries = node_summary(samples)
         write_csv(args.output_dir / "node_summary.csv", list(summaries[0]), summaries)
         if validation:
@@ -160,9 +184,9 @@ def main(argv=None):
         (args.output_dir / "report.json").write_text(encoded_report + "\n", encoding="utf-8")
     except (OSError, ValueError, OverflowError) as exc:
         parser.error(str(exc))
-    print("node_count,expected_sync_us")
-    for row in predictions:
-        print(f"{row['node_count']},{row['expected_sync_us']:.12g}")
+    writer = csv.DictWriter(sys.stdout, fieldnames=list(predictions[0]))
+    writer.writeheader()
+    writer.writerows(predictions)
     print(f"Results: {args.output_dir}", file=sys.stderr)
     print("Empirical predictions are bounded by the observed sample range; "
           "check tail coverage before extrapolation.", file=sys.stderr)

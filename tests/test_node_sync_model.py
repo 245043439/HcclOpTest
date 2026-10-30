@@ -19,6 +19,47 @@ SPEC.loader.exec_module(model)
 
 
 class NodeSyncModelTests(unittest.TestCase):
+    def test_error_averages_per_step_spans_for_required_nodes(self):
+        samples = [("1", "0", 0, 2), ("1", "1", 4, 8), ("1", "2", -100, 100),
+                   ("2", "0", 100, 102), ("2", "1", 101, 104)]
+        result = model.prediction_with_error(samples, 2, 9)
+        self.assertEqual(result["y_true_mean_us"], 6)
+        self.assertEqual(result["error_us"], 3)
+        self.assertEqual(result["absolute_error_us"], 3)
+        self.assertEqual(result["relative_error"], 0.5)
+        self.assertEqual(result["iteration_count"], 2)
+        self.assertEqual(result["error_status"], "ok")
+        for n in [3, 4]:
+            result = model.prediction_with_error(samples, n, 9)
+            self.assertEqual(result["error_status"], "missing_required_nodes")
+            self.assertIsNone(result["y_true_mean_us"])
+        result = model.prediction_with_error([("1", "0", 2, 2)], 1, 1)
+        self.assertEqual(result["error_us"], 1)
+        self.assertIsNone(result["relative_error"])
+
+    def test_cli_error_uses_unfiltered_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = root / "train.csv"
+            train.write_text("iteration,node_id,A_us,B_us\n"
+                             "1,0,0,2\n1,1,4,8\n2,0,2,4\n2,1,3,6\n")
+            output = root / "output"
+            with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+                model.main(["--input", str(train), "--node-id", "0", "--nodes", "2", "4",
+                            "--output-dir", str(output)])
+            report = json.loads((output / "report.json").read_text())
+            row = report["predictions"][0]
+            self.assertEqual(row["expected_sync_us"], 3)
+            self.assertEqual(row["y_true_mean_us"], 6)
+            self.assertEqual(row["error_us"], -3)
+            self.assertEqual(row["absolute_error_us"], 3)
+            self.assertEqual(row["relative_error"], -0.5)
+            with (output / "predictions.csv").open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows, list(csv.DictReader(io.StringIO(stdout.getvalue()))))
+            self.assertEqual(rows[1]["error_status"], "missing_required_nodes")
+            self.assertEqual(rows[1]["error_us"], "")
+
     def test_node_filter_changes_fit_but_preserves_validation_nodes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -30,10 +30,29 @@ python3 node_sync_model/node_sync_model.py \
 ```
 
 输出目录必须是新路径。`cdf.csv` 保存所有不同样本取值处的右连续经验 CDF
-`t_us,F_A,F_B`；`predictions.csv` 保存 `node_count,expected_sync_us`。
+`t_us,F_A,F_B`；`predictions.csv` 保存预测值和误差，终端也输出相同结果。
 计算按相邻样本取值划分区间，累加
 `区间宽度 × [1 - F_B(t)^N - (1 - F_A(t))^N]`，无需设置积分步长或假设正态分布。
 每个 node 每轮的样本对等权参与估计，不要求恰好采集 50 轮。
+
+对 `--nodes` 中的每个规模 N，自动从**未过滤的输入 CSV** 计算真实均值：
+每个 step（`iteration`）选取 `node_id` 为字符串 `0` 到 `N-1` 的节点，计算
+`y_true = max(B_i) - min(A_i)`，再对所有 step 的 y_true 等权求均值。
+先逐 step 求跨度，再求均值；额外节点不参与该规模的真实值计算。
+
+`predictions.csv` 和 `report.json` 中的预测结果包含：
+
+- `expected_sync_us`：CDF 预测的平均同步时延。
+- `y_true_mean_us`：所有 step 的真实跨度均值。
+- `error_us`：预测均值减真实均值。
+- `absolute_error_us`：上述差值的绝对值。
+- `relative_error`：上述差值除以真实均值，无量纲；真实均值为零时留空。
+- `iteration_count`：原始输入的 step 数量。
+- `error_status`：成功为 `ok`；任意 step 缺少所需节点时为 `missing_required_nodes`，
+  该规模的真实均值与误差留空（JSON 为 null），预测值仍输出，不丢弃缺失 step 后求均值。
+
+例如输入包含节点 0、1，指定 `--nodes 2 4` 时，计算 2 node 的误差，4 node 仅输出预测。
+此误差使用输入数据评估；独立数据验证仍通过 `--validation` 提供。
 
 可使用 `--node-id 0` 仅以指定节点的样本估计 CDF：
 
