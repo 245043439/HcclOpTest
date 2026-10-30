@@ -8,7 +8,9 @@ import itertools
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
+from unittest import mock
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -18,16 +20,72 @@ model = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(model)
 
 
+PLOT_SPEC = importlib.util.spec_from_file_location(
+    "plot_node_distributions", Path(__file__).resolve().parents[1]
+    / "node_sync_model/plot_node_distributions.py")
+plotter = importlib.util.module_from_spec(PLOT_SPEC)
+with mock.patch.dict(sys.modules, {"node_sync_model": model}):
+    PLOT_SPEC.loader.exec_module(plotter)
+
+
 class NodeSyncModelTests(unittest.TestCase):
-    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib is not installed")
+    @unittest.skipUnless(importlib.util.find_spec("seaborn") and importlib.util.find_spec("scipy"),
+                         "seaborn/scipy are not installed")
+    def test_node_comparison_keeps_samples_separate_on_shared_axes(self):
+        import seaborn as sns
+
+        samples = [("1", "0", 1, 3), ("2", "0", 2, 4),
+                   ("1", "1", 10, 30), ("2", "1", 20, 40)]
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(sns, "kdeplot", wraps=sns.kdeplot) as kde:
+                plotter.plot_distributions(samples, Path(directory))
+            calls = [call.kwargs for call in kde.call_args_list]
+            self.assertEqual(len(calls), 8)
+            self.assertEqual([call["x"] for call in calls[:4]],
+                             [[1, 2], [10, 20], [3, 4], [30, 40]])
+            self.assertIs(calls[0]["ax"], calls[1]["ax"])
+            self.assertIs(calls[2]["ax"], calls[3]["ax"])
+            self.assertIsNot(calls[0]["ax"], calls[2]["ax"])
+            self.assertEqual(calls[0]["color"], calls[2]["color"])
+            self.assertEqual(calls[0]["color"], calls[4]["color"])
+            self.assertIn("node 0", calls[0]["label"])
+            self.assertIn("node 1", calls[1]["label"])
+            self.assertTrue(all(call["cumulative"] for call in calls[:4]))
+            self.assertTrue(all(not call["cumulative"] for call in calls[4:]))
+
+            source = Path(directory) / "samples.csv"
+            source.write_text("iteration,node_id,A_us,B_us\n1,0,1,3\n1,1,10,30\n")
+            selected = Path(directory) / "selected"
+            with mock.patch.object(plotter, "plot_distributions") as plot, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                plotter.main(["--input", str(source), "--node-ids", "1",
+                              "--output-dir", str(selected)])
+            self.assertEqual(plot.call_args.args[0], [("1", "1", 10, 30)])
+            missing = Path(directory) / "missing"
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                plotter.main(["--input", str(source), "--node-ids", "2",
+                              "--output-dir", str(missing)])
+            self.assertFalse(missing.exists())
+
+    @unittest.skipUnless(importlib.util.find_spec("seaborn") and importlib.util.find_spec("scipy"),
+                         "seaborn/scipy are not installed")
     def test_plots_support_constant_and_varied_samples(self):
+        import seaborn as sns
+
         cases = [[("1", "0", 3, 3)],
+                 [("1", "0", 1, 3), ("2", "0", 1, 4)],
                  [("1", "0", 0, 2), ("2", "0", 2, 4), ("3", "0", 2, 5)]]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             for samples in cases:
                 with self.subTest(samples=samples):
-                    model.plot_distributions(samples, model.empirical_cdf(samples), output, "0")
+                    with mock.patch.object(sns, "kdeplot", wraps=sns.kdeplot) as kde:
+                        plotter.plot_distributions(samples, output)
+                    variable_count = sum(len({row[index] for row in samples}) > 1
+                                         for index in (2, 3))
+                    self.assertEqual(kde.call_count, variable_count * 2)
+                    self.assertEqual(sum(call.kwargs["cumulative"] for call in kde.call_args_list),
+                                     variable_count)
                     for name in ["cdf.png", "pdf.png"]:
                         image = (output / name).read_bytes()
                         self.assertTrue(image.startswith(b"\x89PNG\r\n\x1a\n"))
@@ -59,7 +117,7 @@ class NodeSyncModelTests(unittest.TestCase):
                              "1,0,0,2\n1,1,4,8\n2,0,2,4\n2,1,3,6\n")
             output = root / "output"
             with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
-                model.main(["--no-plots", "--input", str(train), "--node-id", "0", "--nodes", "2", "4",
+                model.main(["--input", str(train), "--node-id", "0", "--nodes", "2", "4",
                             "--output-dir", str(output)])
             report = json.loads((output / "report.json").read_text())
             row = report["predictions"][0]
@@ -83,7 +141,7 @@ class NodeSyncModelTests(unittest.TestCase):
             valid.write_text("iteration,node_id,A_us,B_us\n1,01,0,2\n1,1,10,20\n")
             for node_id, expected, count in [(None, 104 / 3, 3), ("01", 2, 2)]:
                 output = root / str(node_id)
-                argv = ["--no-plots", "--input", str(train), "--nodes", "1", "2",
+                argv = ["--input", str(train), "--nodes", "1", "2",
                         "--validation", str(valid), "--output-dir", str(output)]
                 if node_id is not None:
                     argv.extend(["--node-id", node_id])
@@ -103,7 +161,7 @@ class NodeSyncModelTests(unittest.TestCase):
                         self.assertEqual([r["node_id"] for r in csv.DictReader(stream)], ["01"])
             output = root / "missing"
             with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
-                model.main(["--no-plots", "--input", str(train), "--node-id", "missing", "--nodes", "2",
+                model.main(["--input", str(train), "--node-id", "missing", "--nodes", "2",
                             "--output-dir", str(output)])
             self.assertEqual(error.exception.code, 2)
             self.assertIn("no training samples match", stderr.getvalue())
@@ -153,7 +211,7 @@ class NodeSyncModelTests(unittest.TestCase):
             valid.write_text("iteration,node_id,A_us,B_us\n1,0,3,3\n1,1,3,3\n")
             output = root / "output"
             self.assertEqual(model.main([
-                "--no-plots", "--input", str(train), "--nodes", "1", "2", "4",
+                "--input", str(train), "--nodes", "1", "2", "4",
                 "--validation", str(valid), "--output-dir", str(output)]), 0)
             report = json.loads((output / "report.json").read_text())
             self.assertEqual([r["expected_sync_us"] for r in report["predictions"]],

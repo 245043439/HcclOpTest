@@ -1,8 +1,8 @@
 # 单 node 启动分布与同步时延外推
 
-`node_sync_model/node_sync_model.py` 实现通信建模文档第 4、5 节。数值计算仅依赖 Python 标准库，
-默认绘图需要 Matplotlib，可在仓库根目录执行 `pip install -r node_sync_model/requirements.txt` 安装。
-使用 `--no-plots` 可跳过绘图及该依赖。
+`node_sync_model/node_sync_model.py` 实现通信建模文档第 4、5 节，仅依赖 Python 标准库，
+负责 CDF 估计、预测和误差输出。绘图由独立脚本 `plot_node_distributions.py` 完成。
+计算脚本不再生成图片；旧参数 `--no-plots` 保留兼容，但无需再指定。
 输入为第 3 节的样本 CSV，时间单位统一为微秒，每个 `(iteration, node_id)` 一行：
 
 ```csv
@@ -33,16 +33,6 @@ python3 node_sync_model/node_sync_model.py \
 
 输出目录必须是新路径。`cdf.csv` 保存所有不同样本取值处的右连续经验 CDF
 `t_us,F_A,F_B`；`predictions.csv` 保存预测值和误差，终端也输出相同结果。
-默认还生成 `cdf.png` 与 `pdf.png`，每张图同时显示 A、B 两个分布：
-
-- `cdf.png`：右连续经验 CDF 阶梯图，横轴为启动延迟（us），纵轴为累积概率。
-- `pdf.png`：密度归一化直方图，纵轴为概率密度（1/us），各分布的总面积为 1。
-  A、B 共用等宽分箱，分箱数为 `ceil(log2(M)) + 1`，M 为拟合样本对数。
-  全部样本取值相同时，使用该值两侧的有限宽度区间绘图。
-
-两张图均使用 `--node-id` 过滤后的拟合样本。经验分布是离散分布，没有连续 PDF；
-这里的 PDF 图为直方图密度估计，其形状受分箱影响，不参与预测积分。
-
 计算按相邻样本取值划分区间，累加
 `区间宽度 × [1 - F_B(t)^N - (1 - F_A(t))^N]`，无需设置积分步长或假设正态分布。
 每个 node 每轮的样本对等权参与估计，不要求恰好采集 50 轮。
@@ -85,6 +75,36 @@ CDF、预测、节点摘要及报告中的训练样本统计均基于过滤后�
 要求同一验证文件每轮 node 集合完整且一致。`error_us` 为预测减观测，
 `relative_error` 为该差值除以观测均值（无量纲，观测为零时 CSV 留空、JSON 为 null）。
 `report.json` 汇总输入规模、预测、验证、模型假设与局限。
+
+## 比较不同 node 的 CDF 与 PDF
+
+绘图脚本直接读取原始样本 CSV，不需要先运行预测脚本。安装绘图依赖后运行：
+
+```bash
+pip install -r node_sync_model/requirements.txt
+
+# 默认比较输入中的全部 node。
+python3 node_sync_model/plot_node_distributions.py \
+  --input samples_2nodes.csv --output-dir node_distribution_plots
+
+# 可选：只比较指定 node，按字符串精确匹配。
+python3 node_sync_model/plot_node_distributions.py \
+  --input samples_2nodes.csv --node-ids 0 1 --output-dir selected_node_plots
+```
+
+输出目录必须是新路径。生成 `cdf.png` 和 `pdf.png`，每张图分为 A（最早启动）和 B（最晚启动）
+两个子图，每个子图叠加不同 node 的曲线。同一个 node 在两张图的所有子图中颜色一致，
+图例标出 node_id 和该节点样本数。每个 node 单独估计分布，不合并节点样本。
+指定不存在的 node_id 时直接报错。
+
+- `cdf.png`：Seaborn `kdeplot(cumulative=True)`，横轴为启动延迟（us），纵轴为累积概率。
+- `pdf.png`：Seaborn `kdeplot`，纵轴为概率密度（1/us）。
+- 每个 node 的 A、B 分别使用高斯核和 Scott 带宽（`bw_adjust=1`），曲线在样本范围外延伸
+  4 倍带宽，使用 512 个绘图网格点。平滑曲线可能延伸到负延迟区域。
+- 单样本或全部值相同的分布无法估计 KDE 带宽：CDF 回退为 Seaborn 经验 CDF，
+  PDF 用竖虚线标注点质量，无有限密度值。
+
+KDE 仅用于展示。计算脚本的 `cdf.csv` 和预测积分仍使用经验 CDF，预测值与误差不受绘图影响。
 
 模型假设各 node 具有共同发起参考时刻、node 样本对独立同分布，且单 node 分布不随规模改变。
 验证使用相对本地基准的启动跨度，与文档定义一致。节点摘要和均值误差不能证明这些假设，
