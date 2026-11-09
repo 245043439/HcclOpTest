@@ -66,8 +66,11 @@ def run(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     if world_size < 2:
         raise ValueError("launch with torchrun and at least two ranks")
-    if args.operator == "alltoall" and args.size_bytes % (DTYPE_BYTES[args.dtype] * world_size):
-        raise ValueError("alltoall element count must be divisible by world size")
+    if args.operator in ("alltoall", "reducescatter", "allgather") and \
+            args.size_bytes % (DTYPE_BYTES[args.dtype] * world_size):
+        if args.operator == "allgather":
+            raise ValueError("allgather total output element count must be divisible by world size")
+        raise ValueError(f"{args.operator} element count must be divisible by world size")
     args.output.mkdir(parents=True, exist_ok=True)
     result_path = args.output / f"rank_{rank}.json"
     if result_path.exists():
@@ -96,6 +99,15 @@ def run(args):
         if args.operator == "alltoall":
             out = torch.empty_like(x)
             fn = lambda: dist.all_to_all_single(out, x)
+        elif args.operator == "allgather":
+            inp = torch.empty(args.size_bytes // (DTYPE_BYTES[args.dtype] * world_size),
+                              dtype=getattr(torch, args.dtype), device=f"npu:{local_rank}")
+            out = torch.empty_like(x)
+            fn = lambda: dist.all_gather_into_tensor(out, inp)
+        elif args.operator == "reducescatter":
+            out = torch.empty(args.size_bytes // (DTYPE_BYTES[args.dtype] * world_size),
+                              dtype=getattr(torch, args.dtype), device=f"npu:{local_rank}")
+            fn = lambda: dist.reduce_scatter_tensor(out, x)
         else:
             fn = lambda: dist.all_reduce(x)
         run_fn = graph_callable(fn, args.execution_mode, torch)
@@ -159,7 +171,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     runner = commands.add_parser("run", help="launch under torchrun, optionally wrap each rank with msprof")
-    runner.add_argument("--operator", choices=("allreduce", "alltoall"), default="allreduce")
+    runner.add_argument("--operator", choices=("allreduce", "alltoall", "allgather", "reducescatter"), default="allreduce")
     runner.add_argument("--size-bytes", type=int, default=1024 ** 2)
     runner.add_argument("--dtype", choices=DTYPE_BYTES, default="float32")
     runner.add_argument("--warmup", type=int, default=10)
